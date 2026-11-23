@@ -31,6 +31,33 @@ extern "C" {
 #define PROT_AUTH_KEY_BYTES        32U
 #define PROT_MAX_PASSWORD_BYTES    32U
 #define PROT_UNIT_CONFIG_BYTES     50U
+#define PROT_MAX_MODBUS_MAP_ENTRIES 64U
+
+typedef enum {
+    PROT_MB_TABLE_COIL          = 0,
+    PROT_MB_TABLE_DISCRETE      = 1,
+    PROT_MB_TABLE_HOLDING_REG   = 2,
+    PROT_MB_TABLE_INPUT_REG     = 3
+} ProtModbusTable_t;
+
+typedef enum {
+    PROT_MB_TARGET_DI       = 0,
+    PROT_MB_TARGET_DO       = 1,
+    PROT_MB_TARGET_AI       = 2,
+    PROT_MB_TARGET_AO       = 3,
+    PROT_MB_TARGET_VM_BOOL  = 4,
+    PROT_MB_TARGET_VM_INT   = 5,
+    PROT_MB_TARGET_VM_FLOAT = 6
+} ProtModbusTargetKind_t;
+
+typedef struct {
+    uint8_t  table;
+    uint8_t  targetKind;
+    uint16_t modbusAddr;
+    uint16_t targetIdx;
+    uint8_t  flags;
+    uint8_t  reserved;
+} ProtModbusMapEntry_t;
 
 typedef enum {
     PROT_RS485_MODE_MARAPROT      = 0,
@@ -86,6 +113,8 @@ typedef enum {
     PROT_OP_ONEWIRE_SCAN     = 0x50,
     PROT_OP_UNIT_CONFIG_GET  = 0x51,
     PROT_OP_UNIT_CONFIG_SET  = 0x52,
+    PROT_OP_MODBUS_MAP_GET   = 0x53,
+    PROT_OP_MODBUS_MAP_SET   = 0x54,
     PROT_OP_FW_ENTER_ROM_DFU = 0xF3
 } ProtOpcode_t;
 
@@ -121,6 +150,8 @@ typedef struct {
     uint32_t            (*rng_next)(void);
     const char         *p_password;
     void                (*unit_config_saved)(const ProtUnitConfig_t *p_cfg, const char *p_password);
+    uint8_t             (*modbus_map_get)(ProtModbusMapEntry_t *p_outEntries, uint8_t maxEntries);
+    bool                (*modbus_map_set)(const ProtModbusMapEntry_t *p_entries, uint8_t count);
 } ProtTransport_t;
 
 typedef struct {

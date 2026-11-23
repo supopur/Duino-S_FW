@@ -64,6 +64,14 @@ typedef struct {
     char             password[PROT_MAX_PASSWORD_BYTES + 1U];
 } PlcEepromUnitConfig_t;
 
+typedef struct {
+    uint32_t             magic;
+    uint32_t             crc32;
+    uint8_t              count;
+    uint8_t              reserved[3];
+    ProtModbusMapEntry_t entries[PROT_MAX_MODBUS_MAP_ENTRIES];
+} PlcEepromModbusMap_t;
+
 extern volatile uint16_t plc_adc_raw[PLC_ADC_COUNT];
 
 // Indexed directly by logical DIO channel number (DIO2 .. DIO27).
@@ -119,6 +127,8 @@ static volatile uint16_t g_plc_hal_rxHead = 0U;
 static volatile uint16_t g_plc_hal_rxTail = 0U;
 static uint8_t           g_plc_hal_rs485RxBuf[PLC_HAL_RS485_RX_BUF_SIZE];
 static uint16_t          g_plc_hal_rs485RxTail = 0U;
+static ProtModbusMapEntry_t g_plc_hal_modbusMap[PROT_MAX_MODBUS_MAP_ENTRIES];
+static uint8_t              g_plc_hal_modbusMapCount = 0U;
 
 static const uint32_t kRs485BaudRates[8] = {
     9600U, 19200U, 38400U, 57600U, 115200U, 230400U, 460800U, 921600U
@@ -756,6 +766,133 @@ static void modbus_send_exception(uint8_t slaveId, uint8_t fc, uint8_t exCode)
     rs485_tx_send(resp, 5U);
 }
 
+static const ProtModbusMapEntry_t *find_modbus_map_entry(uint8_t table, uint16_t addr)
+{
+    for (uint8_t i = 0U; i < g_plc_hal_modbusMapCount; i++) {
+        if (g_plc_hal_modbusMap[i].table == table && g_plc_hal_modbusMap[i].modbusAddr == addr) {
+            return &g_plc_hal_modbusMap[i];
+        }
+    }
+    return NULL;
+}
+
+static bool read_mapped_bit(const ProtModbusMapEntry_t *e, uint8_t *p_out)
+{
+    uint16_t idx = e->targetIdx;
+    switch (e->targetKind) {
+        case PROT_MB_TARGET_DI:
+            *p_out = hal_di_read(idx);
+            return (idx < PLC_DIO_MAX_INDEX && kDioMap[idx].p_port != NULL);
+        case PROT_MB_TARGET_DO:
+            if (idx >= PLC_DIO_MAX_INDEX || kDioMap[idx].p_port == NULL) { return false; }
+            *p_out = (HAL_GPIO_ReadPin(kDioMap[idx].p_port, kDioMap[idx].pin) == GPIO_PIN_SET) ? 1U : 0U;
+            return true;
+        case PROT_MB_TARGET_VM_BOOL:
+            if (idx >= VM_MAX_BOOL_SLOTS) { return false; }
+            *p_out = g_plc_hal_vm.boolRam[idx] ? 1U : 0U;
+            return true;
+        case PROT_MB_TARGET_VM_INT:
+            if (idx >= VM_MAX_INT_SLOTS) { return false; }
+            *p_out = (g_plc_hal_vm.intRam[idx] != 0) ? 1U : 0U;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool write_mapped_bit(const ProtModbusMapEntry_t *e, uint8_t val)
+{
+    if ((e->flags & 0x01U) != 0U) {
+        return false;
+    }
+    uint16_t idx = e->targetIdx;
+    switch (e->targetKind) {
+        case PROT_MB_TARGET_DO:
+            if (idx >= PLC_DIO_MAX_INDEX || kDioMap[idx].p_port == NULL) { return false; }
+            hal_do_write(idx, val ? 1U : 0U);
+            return true;
+        case PROT_MB_TARGET_VM_BOOL:
+            if (idx >= VM_MAX_BOOL_SLOTS) { return false; }
+            g_plc_hal_vm.boolRam[idx] = val ? 1U : 0U;
+            return true;
+        case PROT_MB_TARGET_VM_INT:
+            if (idx >= VM_MAX_INT_SLOTS) { return false; }
+            g_plc_hal_vm.intRam[idx] = val ? 1 : 0;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool read_mapped_reg(const ProtModbusMapEntry_t *e, int16_t *p_out)
+{
+    uint16_t idx = e->targetIdx;
+    switch (e->targetKind) {
+        case PROT_MB_TARGET_AI:
+            if (idx >= PLC_ADC_COUNT) { return false; }
+            *p_out = (int16_t)hal_ai_read(idx);
+            return true;
+        case PROT_MB_TARGET_AO:
+            if (idx >= PLC_DAC_COUNT) { return false; }
+            *p_out = (int16_t)HAL_DAC_GetValue(&hdac, (idx == 0U) ? DAC_CHANNEL_1 : DAC_CHANNEL_2);
+            return true;
+        case PROT_MB_TARGET_DI:
+            if (idx >= PLC_DIO_MAX_INDEX || kDioMap[idx].p_port == NULL) { return false; }
+            *p_out = (int16_t)hal_di_read(idx);
+            return true;
+        case PROT_MB_TARGET_DO:
+            if (idx >= PLC_DIO_MAX_INDEX || kDioMap[idx].p_port == NULL) { return false; }
+            *p_out = (HAL_GPIO_ReadPin(kDioMap[idx].p_port, kDioMap[idx].pin) == GPIO_PIN_SET) ? 1 : 0;
+            return true;
+        case PROT_MB_TARGET_VM_BOOL:
+            if (idx >= VM_MAX_BOOL_SLOTS) { return false; }
+            *p_out = g_plc_hal_vm.boolRam[idx] ? 1 : 0;
+            return true;
+        case PROT_MB_TARGET_VM_INT:
+            if (idx >= VM_MAX_INT_SLOTS) { return false; }
+            *p_out = (int16_t)g_plc_hal_vm.intRam[idx];
+            return true;
+        case PROT_MB_TARGET_VM_FLOAT:
+            if (idx >= VM_MAX_FLOAT_SLOTS) { return false; }
+            *p_out = (int16_t)g_plc_hal_vm.floatRam[idx];
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool write_mapped_reg(const ProtModbusMapEntry_t *e, int16_t val)
+{
+    if ((e->flags & 0x01U) != 0U) {
+        return false;
+    }
+    uint16_t idx = e->targetIdx;
+    switch (e->targetKind) {
+        case PROT_MB_TARGET_AO:
+            if (idx >= PLC_DAC_COUNT) { return false; }
+            hal_ao_write(idx, (int32_t)val);
+            return true;
+        case PROT_MB_TARGET_DO:
+            if (idx >= PLC_DIO_MAX_INDEX || kDioMap[idx].p_port == NULL) { return false; }
+            hal_do_write(idx, (val != 0) ? 1U : 0U);
+            return true;
+        case PROT_MB_TARGET_VM_BOOL:
+            if (idx >= VM_MAX_BOOL_SLOTS) { return false; }
+            g_plc_hal_vm.boolRam[idx] = (val != 0) ? 1U : 0U;
+            return true;
+        case PROT_MB_TARGET_VM_INT:
+            if (idx >= VM_MAX_INT_SLOTS) { return false; }
+            g_plc_hal_vm.intRam[idx] = (int32_t)val;
+            return true;
+        case PROT_MB_TARGET_VM_FLOAT:
+            if (idx >= VM_MAX_FLOAT_SLOTS) { return false; }
+            g_plc_hal_vm.floatRam[idx] = (float)val;
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void poll_modbus_rtu_slave(void)
 {
     static uint8_t  rxBuf[128];
@@ -799,23 +936,25 @@ static void poll_modbus_rtu_slave(void)
     uint16_t txLen = 0U;
 
     switch (fc) {
-        case 0x01U: /* Read Coils (DO0..DO27) */
-        case 0x02U: /* Read Discrete Inputs (DI0..DI27) */ {
-            if (val < 1U || val > 28U || (addr + val) > 28U) {
+        case 0x01U:
+        case 0x02U: {
+            if (val < 1U || val > 64U) {
                 modbus_send_exception(slaveId, fc, 0x02U);
                 return;
             }
+            uint8_t table = (fc == 0x01U) ? (uint8_t)PROT_MB_TABLE_COIL : (uint8_t)PROT_MB_TABLE_DISCRETE;
             uint8_t byteCount = (uint8_t)((val + 7U) / 8U);
             tx[0] = slaveId;
             tx[1] = fc;
             tx[2] = byteCount;
             memset(&tx[3], 0, byteCount);
             for (uint16_t i = 0U; i < val; i++) {
-                uint16_t ch = (uint16_t)(addr + i);
-                uint8_t bit = (fc == 0x01U)
-                    ? ((ch < PLC_DIO_MAX_INDEX && kDioMap[ch].p_port != NULL &&
-                        HAL_GPIO_ReadPin(kDioMap[ch].p_port, kDioMap[ch].pin) == GPIO_PIN_SET) ? 1U : 0U)
-                    : hal_di_read(ch);
+                const ProtModbusMapEntry_t *e = find_modbus_map_entry(table, (uint16_t)(addr + i));
+                uint8_t bit = 0U;
+                if (e == NULL || !read_mapped_bit(e, &bit)) {
+                    modbus_send_exception(slaveId, fc, 0x02U);
+                    return;
+                }
                 if (bit != 0U) {
                     tx[3U + (i / 8U)] |= (uint8_t)(1U << (i % 8U));
                 }
@@ -823,34 +962,23 @@ static void poll_modbus_rtu_slave(void)
             txLen = (uint16_t)(3U + byteCount);
             break;
         }
-        case 0x03U: /* Read Holding Registers (0..1: AO, 100..227: VM intRam) */
-        case 0x04U: /* Read Input Registers (0..3: AI) */ {
+        case 0x03U:
+        case 0x04U: {
             if (val < 1U || val > 64U) {
                 modbus_send_exception(slaveId, fc, 0x02U);
                 return;
             }
+            uint8_t table = (fc == 0x03U) ? (uint8_t)PROT_MB_TABLE_HOLDING_REG : (uint8_t)PROT_MB_TABLE_INPUT_REG;
             uint8_t byteCount = (uint8_t)(val * 2U);
             tx[0] = slaveId;
             tx[1] = fc;
             tx[2] = byteCount;
             for (uint16_t i = 0U; i < val; i++) {
-                uint16_t rAddr = (uint16_t)(addr + i);
-                int32_t rVal = 0;
-                if (fc == 0x04U) {
-                    if (rAddr >= PLC_ADC_COUNT) {
-                        modbus_send_exception(slaveId, fc, 0x02U);
-                        return;
-                    }
-                    rVal = hal_ai_read(rAddr);
-                } else {
-                    if (rAddr < PLC_DAC_COUNT) {
-                        rVal = (int32_t)HAL_DAC_GetValue(&hdac, (rAddr == 0U) ? DAC_CHANNEL_1 : DAC_CHANNEL_2);
-                    } else if (rAddr >= 100U && (rAddr - 100U) < 128U) {
-                        rVal = g_plc_hal_vm.intRam[rAddr - 100U];
-                    } else {
-                        modbus_send_exception(slaveId, fc, 0x02U);
-                        return;
-                    }
+                const ProtModbusMapEntry_t *e = find_modbus_map_entry(table, (uint16_t)(addr + i));
+                int16_t rVal = 0;
+                if (e == NULL || !read_mapped_reg(e, &rVal)) {
+                    modbus_send_exception(slaveId, fc, 0x02U);
+                    return;
                 }
                 tx[3U + (i * 2U)] = (uint8_t)(((uint16_t)rVal) >> 8U);
                 tx[4U + (i * 2U)] = (uint8_t)(((uint16_t)rVal) & 0xFFU);
@@ -858,23 +986,9 @@ static void poll_modbus_rtu_slave(void)
             txLen = (uint16_t)(3U + byteCount);
             break;
         }
-        case 0x05U: /* Write Single Coil (DO0..DO27) */ {
-            if (addr >= PLC_DIO_MAX_INDEX || kDioMap[addr].p_port == NULL) {
-                modbus_send_exception(slaveId, fc, 0x02U);
-                return;
-            }
-            hal_do_write(addr, (val == 0xFF00U) ? 1U : 0U);
-            memcpy(tx, rxBuf, 6U);
-            txLen = 6U;
-            break;
-        }
-        case 0x06U: /* Write Single Holding Register */ {
-            int16_t sVal = (int16_t)val;
-            if (addr < PLC_DAC_COUNT) {
-                hal_ao_write(addr, (int32_t)sVal);
-            } else if (addr >= 100U && (addr - 100U) < 128U) {
-                g_plc_hal_vm.intRam[addr - 100U] = (int32_t)sVal;
-            } else {
+        case 0x05U: {
+            const ProtModbusMapEntry_t *e = find_modbus_map_entry((uint8_t)PROT_MB_TABLE_COIL, addr);
+            if (e == NULL || !write_mapped_bit(e, (val == 0xFF00U) ? 1U : 0U)) {
                 modbus_send_exception(slaveId, fc, 0x02U);
                 return;
             }
@@ -882,32 +996,42 @@ static void poll_modbus_rtu_slave(void)
             txLen = 6U;
             break;
         }
-        case 0x0FU: /* Write Multiple Coils */ {
-            if (frameLen < 9U || val < 1U || (addr + val) > PLC_DIO_MAX_INDEX) {
+        case 0x06U: {
+            const ProtModbusMapEntry_t *e = find_modbus_map_entry((uint8_t)PROT_MB_TABLE_HOLDING_REG, addr);
+            if (e == NULL || !write_mapped_reg(e, (int16_t)val)) {
                 modbus_send_exception(slaveId, fc, 0x02U);
                 return;
-            }
-            for (uint16_t i = 0U; i < val; i++) {
-                uint8_t bit = (uint8_t)((rxBuf[7U + (i / 8U)] >> (i % 8U)) & 0x01U);
-                hal_do_write((uint16_t)(addr + i), bit);
             }
             memcpy(tx, rxBuf, 6U);
             txLen = 6U;
             break;
         }
-        case 0x10U: /* Write Multiple Holding Registers */ {
+        case 0x0FU: {
             if (frameLen < 9U || val < 1U || val > 64U) {
                 modbus_send_exception(slaveId, fc, 0x02U);
                 return;
             }
             for (uint16_t i = 0U; i < val; i++) {
-                uint16_t rAddr = (uint16_t)(addr + i);
+                const ProtModbusMapEntry_t *e = find_modbus_map_entry((uint8_t)PROT_MB_TABLE_COIL, (uint16_t)(addr + i));
+                uint8_t bit = (uint8_t)((rxBuf[7U + (i / 8U)] >> (i % 8U)) & 0x01U);
+                if (e == NULL || !write_mapped_bit(e, bit)) {
+                    modbus_send_exception(slaveId, fc, 0x02U);
+                    return;
+                }
+            }
+            memcpy(tx, rxBuf, 6U);
+            txLen = 6U;
+            break;
+        }
+        case 0x10U: {
+            if (frameLen < 9U || val < 1U || val > 64U) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            for (uint16_t i = 0U; i < val; i++) {
+                const ProtModbusMapEntry_t *e = find_modbus_map_entry((uint8_t)PROT_MB_TABLE_HOLDING_REG, (uint16_t)(addr + i));
                 int16_t sVal = (int16_t)modbus_read_u16_be(&rxBuf[7U + (i * 2U)]);
-                if (rAddr < PLC_DAC_COUNT) {
-                    hal_ao_write(rAddr, (int32_t)sVal);
-                } else if (rAddr >= 100U && (rAddr - 100U) < 128U) {
-                    g_plc_hal_vm.intRam[rAddr - 100U] = (int32_t)sVal;
-                } else {
+                if (e == NULL || !write_mapped_reg(e, sVal)) {
                     modbus_send_exception(slaveId, fc, 0x02U);
                     return;
                 }
@@ -1196,6 +1320,80 @@ static void ensure_eeprom_ready(void)
     }
 }
 
+static uint32_t modbus_map_crc32(const PlcEepromModbusMap_t *p_rec)
+{
+    const uint8_t *p_bytes = (const uint8_t *)&p_rec->count;
+    size_t len = sizeof(PlcEepromModbusMap_t) - offsetof(PlcEepromModbusMap_t, count);
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0U; i < len; i++) {
+        crc ^= p_bytes[i];
+        for (uint8_t b = 0U; b < 8U; b++) {
+            crc = (crc & 1U) ? ((crc >> 1U) ^ 0xEDB88320U) : (crc >> 1U);
+        }
+    }
+    return ~crc;
+}
+
+static void load_modbus_map_from_eeprom(void)
+{
+    g_plc_hal_modbusMapCount = 0U;
+    if (!g_plc_hal_eepromReady) {
+        return;
+    }
+    PlcEepromModbusMap_t rec;
+    eeprom_lock();
+    Bl24c256aStatus_t st = BL24C256A_READ_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_MBMAP_ADDR, &rec);
+    eeprom_unlock();
+    if (st == BL24C256A_OK &&
+        rec.magic == PLC_HAL_EEPROM_MBMAP_MAGIC &&
+        rec.count <= PROT_MAX_MODBUS_MAP_ENTRIES &&
+        rec.crc32 == modbus_map_crc32(&rec)) {
+        g_plc_hal_modbusMapCount = rec.count;
+        if (rec.count > 0U) {
+            memcpy(g_plc_hal_modbusMap, rec.entries, (size_t)rec.count * sizeof(ProtModbusMapEntry_t));
+        }
+    }
+}
+
+static uint8_t hal_modbus_map_get(ProtModbusMapEntry_t *p_outEntries, uint8_t maxEntries)
+{
+    uint8_t n = (g_plc_hal_modbusMapCount < maxEntries) ? g_plc_hal_modbusMapCount : maxEntries;
+    if (p_outEntries != NULL && n > 0U) {
+        memcpy(p_outEntries, g_plc_hal_modbusMap, (size_t)n * sizeof(ProtModbusMapEntry_t));
+    }
+    return n;
+}
+
+static bool hal_modbus_map_set(const ProtModbusMapEntry_t *p_entries, uint8_t count)
+{
+    if (count > PROT_MAX_MODBUS_MAP_ENTRIES || (count > 0U && p_entries == NULL)) {
+        return false;
+    }
+    g_plc_hal_modbusMapCount = count;
+    if (count > 0U) {
+        memcpy(g_plc_hal_modbusMap, p_entries, (size_t)count * sizeof(ProtModbusMapEntry_t));
+    }
+    if (!g_plc_hal_eepromReady) {
+        return true;
+    }
+    PlcEepromModbusMap_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.magic = PLC_HAL_EEPROM_MBMAP_MAGIC;
+    rec.count = count;
+    if (count > 0U) {
+        memcpy(rec.entries, p_entries, (size_t)count * sizeof(ProtModbusMapEntry_t));
+    }
+    rec.crc32 = modbus_map_crc32(&rec);
+    eeprom_lock();
+    Bl24c256aStatus_t st = BL24C256A_UPDATE_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_MBMAP_ADDR, &rec);
+    if (st != BL24C256A_OK) {
+        recover_i2c1();
+        st = BL24C256A_UPDATE_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_MBMAP_ADDR, &rec);
+    }
+    eeprom_unlock();
+    return (st == BL24C256A_OK);
+}
+
 static uint32_t unit_config_crc32(const PlcEepromUnitConfig_t *p_rec)
 {
     const uint8_t *p_bytes = (const uint8_t *)&p_rec->config;
@@ -1354,6 +1552,7 @@ bool PLC_HAL_Init(void)
     ensure_eeprom_ready();
     if (g_plc_hal_eepromReady) {
         load_saved_program_from_eeprom();
+        load_modbus_map_from_eeprom();
     }
 
     bool ethMode = PLC_HAL_IsEthMode();
@@ -1378,7 +1577,9 @@ bool PLC_HAL_Init(void)
         .enter_dfu         = enter_rom_dfu,
         .rng_next          = hal_rng_next,
         .p_password        = g_plc_hal_password,
-        .unit_config_saved = hal_unit_config_saved
+        .unit_config_saved = hal_unit_config_saved,
+        .modbus_map_get    = hal_modbus_map_get,
+        .modbus_map_set    = hal_modbus_map_set
     };
 
     bool ok = PROT_Init(&g_plc_hal_prot, &g_plc_hal_vm, &transport);

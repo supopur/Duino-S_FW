@@ -687,6 +687,62 @@ static void dispatch_frame(ProtInstance_t *p_prot)
         }
         case PROT_OP_UNIT_CONFIG_GET:  handle_unit_config_get(p_prot, seqId); break;
         case PROT_OP_UNIT_CONFIG_SET:  handle_unit_config_set(p_prot, seqId, p_payload, payloadLen); break;
+        case PROT_OP_MODBUS_MAP_GET: {
+            if (p_prot->transport.modbus_map_get != NULL) {
+                ProtModbusMapEntry_t entries[PROT_MAX_MODBUS_MAP_ENTRIES];
+                uint8_t count = p_prot->transport.modbus_map_get(entries, PROT_MAX_MODBUS_MAP_ENTRIES);
+                if (count > PROT_MAX_MODBUS_MAP_ENTRIES) {
+                    count = PROT_MAX_MODBUS_MAP_ENTRIES;
+                }
+                uint8_t *p_out = &p_prot->txBuf[PROT_HEADER_BYTES];
+                p_out[0] = count;
+                for (uint8_t i = 0U; i < count; i++) {
+                    uint16_t off = (uint16_t)(1U + ((uint16_t)i * 8U));
+                    p_out[off + 0U] = entries[i].table;
+                    p_out[off + 1U] = entries[i].targetKind;
+                    write_u16_le(&p_out[off + 2U], entries[i].modbusAddr);
+                    write_u16_le(&p_out[off + 4U], entries[i].targetIdx);
+                    p_out[off + 6U] = entries[i].flags;
+                    p_out[off + 7U] = entries[i].reserved;
+                }
+                send_response(p_prot, seqId, opcode, PROT_STATUS_OK, (uint16_t)(1U + ((uint16_t)count * 8U)));
+            } else {
+                send_response(p_prot, seqId, opcode, PROT_STATUS_ERR_OPCODE, 0U);
+            }
+            break;
+        }
+        case PROT_OP_MODBUS_MAP_SET: {
+            if (p_prot->transport.modbus_map_set == NULL) {
+                send_response(p_prot, seqId, opcode, PROT_STATUS_ERR_OPCODE, 0U);
+                break;
+            }
+            if (payloadLen < 1U) {
+                send_response(p_prot, seqId, opcode, PROT_STATUS_ERR_PARAM, 0U);
+                break;
+            }
+            uint8_t count = p_payload[0];
+            if (count > PROT_MAX_MODBUS_MAP_ENTRIES || payloadLen < (uint16_t)(1U + ((uint16_t)count * 8U))) {
+                send_response(p_prot, seqId, opcode, PROT_STATUS_ERR_PARAM, 0U);
+                break;
+            }
+            ProtModbusMapEntry_t entries[PROT_MAX_MODBUS_MAP_ENTRIES];
+            for (uint8_t i = 0U; i < count; i++) {
+                uint16_t off = (uint16_t)(1U + ((uint16_t)i * 8U));
+                entries[i].table      = p_payload[off + 0U];
+                entries[i].targetKind = p_payload[off + 1U];
+                entries[i].modbusAddr = read_u16_le(&p_payload[off + 2U]);
+                entries[i].targetIdx  = read_u16_le(&p_payload[off + 4U]);
+                entries[i].flags      = p_payload[off + 6U];
+                entries[i].reserved   = p_payload[off + 7U];
+            }
+            if (p_prot->transport.modbus_map_set(entries, count)) {
+                p_prot->txBuf[PROT_HEADER_BYTES] = 1U;
+                send_response(p_prot, seqId, opcode, PROT_STATUS_OK, 1U);
+            } else {
+                send_response(p_prot, seqId, opcode, PROT_STATUS_ERR_STORAGE, 0U);
+            }
+            break;
+        }
         case PROT_OP_FW_ENTER_ROM_DFU: {
             if (payloadLen >= 4U && read_u32_le(p_payload) == PROT_DFU_MAGIC && p_prot->transport.enter_dfu != NULL) {
                 p_prot->txBuf[PROT_HEADER_BYTES] = 1U;
