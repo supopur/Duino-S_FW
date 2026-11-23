@@ -17,6 +17,7 @@ extern "C" {
 #define PROT_VERSION_1             0x10U
 #define PROT_FLAG_RESPONSE         0x01U
 #define PROT_FLAG_ERROR            0x02U
+#define PROT_FLAG_ENCRYPTED        0x04U
 #define PROT_HEADER_BYTES          10U
 #define PROT_CRC_BYTES             2U
 #define PROT_OVERHEAD_BYTES        (PROT_HEADER_BYTES + PROT_CRC_BYTES)
@@ -26,6 +27,26 @@ extern "C" {
 #define PROT_STATION_P2P           0x00U
 #define PROT_STATION_BROADCAST     0xFFU
 #define PROT_DFU_MAGIC             0xDF00B007U
+#define PROT_AUTH_CHALLENGE_BYTES  16U
+#define PROT_AUTH_KEY_BYTES        32U
+#define PROT_MAX_PASSWORD_BYTES    32U
+#define PROT_UNIT_CONFIG_BYTES     48U
+
+typedef struct {
+    char     unitName[16];
+    uint8_t  stationId;
+    uint8_t  ipMode;
+    uint8_t  staticIp[4];
+    uint8_t  subnetMask[4];
+    uint8_t  gateway[4];
+    uint16_t tcpPort;
+    uint8_t  runOutputPin;
+    uint8_t  faultOutputPin;
+    uint8_t  estopOutputPin;
+    uint8_t  bootMode;
+    uint8_t  safeOutputsOnStop;
+    uint8_t  watchdogEnabled;
+} ProtUnitConfig_t;
 
 typedef enum {
     PROT_STATUS_OK = 0,
@@ -34,12 +55,15 @@ typedef enum {
     PROT_STATUS_ERR_PARAM,
     PROT_STATUS_ERR_BUSY,
     PROT_STATUS_ERR_STATE,
-    PROT_STATUS_ERR_STORAGE
+    PROT_STATUS_ERR_STORAGE,
+    PROT_STATUS_ERR_AUTH
 } ProtStatus_t;
 
 typedef enum {
     PROT_OP_PING             = 0x01,
     PROT_OP_GET_INFO         = 0x02,
+    PROT_OP_AUTH_CHALLENGE   = 0x03,
+    PROT_OP_AUTH_VERIFY      = 0x04,
     PROT_OP_VM_STATUS        = 0x10,
     PROT_OP_VM_CONTROL       = 0x11,
     PROT_OP_VM_UPLOAD_BEGIN  = 0x20,
@@ -52,6 +76,8 @@ typedef enum {
     PROT_OP_RTC_GET          = 0x40,
     PROT_OP_RTC_SET          = 0x41,
     PROT_OP_ONEWIRE_SCAN     = 0x50,
+    PROT_OP_UNIT_CONFIG_GET  = 0x51,
+    PROT_OP_UNIT_CONFIG_SET  = 0x52,
     PROT_OP_FW_ENTER_ROM_DFU = 0xF3
 } ProtOpcode_t;
 
@@ -84,6 +110,9 @@ typedef struct {
     bool                (*rtc_set)(int64_t unixSec);
     uint8_t             (*onewire_scan)(uint8_t dioPin, uint8_t *p_outRoms8, uint8_t maxSensors);
     void                (*enter_dfu)(void);
+    uint32_t            (*rng_next)(void);
+    const char         *p_password;
+    void                (*unit_config_saved)(const ProtUnitConfig_t *p_cfg, const char *p_password);
 } ProtTransport_t;
 
 typedef struct {
@@ -102,6 +131,13 @@ typedef struct {
     uint16_t        watchEpoch;
     uint16_t        watchSlots[PROT_MAX_WATCH_SLOTS];
     uint8_t         watchLastRaw[PROT_MAX_WATCH_SLOTS][VM_MAX_SLOT_BYTES];
+    bool            authRequired;
+    bool            authValid;
+    bool            replyEncrypted;
+    uint8_t         authChallenge[PROT_AUTH_CHALLENGE_BYTES];
+    uint8_t         sessionKey[PROT_AUTH_KEY_BYTES];
+    char            password[PROT_MAX_PASSWORD_BYTES + 1U];
+    ProtUnitConfig_t unitConfig;
 } ProtInstance_t;
 
 // Initialize MaraProt server instance bound to a MaraVM and transport callbacks.

@@ -104,7 +104,24 @@ ETH_DMADescTypeDef  DMARxDscrTab[ETH_RX_DESC_CNT]; /* Ethernet Rx DMA Descriptor
 ETH_DMADescTypeDef  DMATxDscrTab[ETH_TX_DESC_CNT]; /* Ethernet Tx DMA Descriptors */
 
 /* USER CODE BEGIN 2 */
+static volatile uint32_t g_eth_rx_frames = 0U;
 
+static void eth_send_gw_arp_cb(void *arg)
+{
+  struct netif *netif = (struct netif *)arg;
+  if (netif_is_up(netif) && netif_is_link_up(netif))
+  {
+    const ip4_addr_t *gw = netif_ip4_gw(netif);
+    if (!ip4_addr_isany_val(*gw))
+    {
+      etharp_request(netif, gw);
+    }
+    else if (!ip4_addr_isany_val(*netif_ip4_addr(netif)))
+    {
+      etharp_gratuitous(netif);
+    }
+  }
+}
 /* USER CODE END 2 */
 
 osSemaphoreId RxPktSemaphore = NULL;   /* Semaphore to signal incoming packets */
@@ -333,6 +350,12 @@ static void low_level_init(struct netif *netif)
 
 /* USER CODE BEGIN LOW_LEVEL_INIT */
   /* Restrict Auto-Negotiation to 10BASE-T (Full/Half) for 50 MHz MCO1 stability */
+  if (netif_is_link_up(netif))
+  {
+    HAL_ETH_Stop_IT(&heth);
+    netif_set_down(netif);
+    netif_set_link_down(netif);
+  }
   ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x04U, 0x0061U);
   ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x00U, 0x1200U);
 
@@ -471,6 +494,7 @@ void ethernetif_input(void* argument)
         p = low_level_input( netif );
         if (p != NULL)
         {
+          g_eth_rx_frames++;
           if (netif->input( p, netif) != ERR_OK )
           {
             pbuf_free(p);
@@ -607,7 +631,11 @@ void HAL_ETH_MspInit(ETH_HandleTypeDef* ethHandle)
   if(ethHandle->Instance==ETH)
   {
   /* USER CODE BEGIN ETH_MspInit 0 */
-
+  __HAL_RCC_SYSCFG_CLK_ENABLE();
+  __HAL_RCC_ETH_CLK_DISABLE();
+  __HAL_RCC_ETHMAC_FORCE_RESET();
+  SYSCFG->PMC |= SYSCFG_PMC_MII_RMII_SEL;
+  __HAL_RCC_ETHMAC_RELEASE_RESET();
   /* USER CODE END ETH_MspInit 0 */
     /* Enable Peripheral clock */
     __HAL_RCC_ETH_CLK_ENABLE();
@@ -777,11 +805,15 @@ void ethernet_link_thread(void* argument)
 
   struct netif *netif = (struct netif *) argument;
 /* USER CODE BEGIN ETH link init */
-
+  uint32_t link_up_tick_ms = 0U;
+  uint32_t rx_at_link_up   = 0U;
+  uint8_t  arp_probe_sent  = 0U;
+  uint8_t  was_link_up     = 0U;
 /* USER CODE END ETH link init */
 
   for(;;)
   {
+  linkchanged = 0U;
   PHYLinkState = DP83848_GetLinkState(&DP83848);
 
   if(netif_is_link_up(netif) && (PHYLinkState <= DP83848_STATUS_LINK_DOWN))
@@ -832,7 +864,50 @@ void ethernet_link_thread(void* argument)
   }
 
 /* USER CODE BEGIN ETH link Thread core code for User BSP */
+  if (netif_is_link_up(netif))
+  {
+    if (!was_link_up)
+    {
+      was_link_up     = 1U;
+      link_up_tick_ms = HAL_GetTick();
+      rx_at_link_up   = g_eth_rx_frames;
+      arp_probe_sent  = 0U;
+    }
+    else if (g_eth_rx_frames == rx_at_link_up)
+    {
+      uint32_t elapsed = HAL_GetTick() - link_up_tick_ms;
+      uint32_t retry_ms = ip4_addr_isany_val(*netif_ip4_addr(netif)) ? 2000U : 1000U;
+      if (arp_probe_sent == 0U && elapsed >= 150U)
+      {
+        arp_probe_sent = 1U;
+        tcpip_callback(eth_send_gw_arp_cb, netif);
+      }
+      else if (arp_probe_sent == 1U && elapsed >= 500U)
+      {
+        arp_probe_sent = 2U;
+        tcpip_callback(eth_send_gw_arp_cb, netif);
+      }
+      else if (elapsed >= retry_ms)
+      {
+        HAL_ETH_Stop_IT(&heth);
+        netif_set_down(netif);
+        netif_set_link_down(netif);
+        was_link_up = 0U;
 
+        HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_RESET);
+        osDelay(25);
+        HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_SET);
+        osDelay(200);
+
+        ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x04U, 0x0061U);
+        ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x00U, 0x1200U);
+      }
+    }
+  }
+  else
+  {
+    was_link_up = 0U;
+  }
 /* USER CODE END ETH link Thread core code for User BSP */
 
     osDelay(100);

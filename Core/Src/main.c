@@ -125,7 +125,7 @@ int main(void)
   HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_RESET);
   HAL_Delay(20);
   HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_SET);
-  HAL_Delay(50);
+  HAL_Delay(200);
   HAL_IWDG_Refresh(&hiwdg);
 
   /* Start 4-channel continuous ADC1 DMA into plc_adc_raw[] */

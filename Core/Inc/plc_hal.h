@@ -18,7 +18,15 @@ extern "C" {
 #define PLC_HAL_EEPROM_HDR_ADDR  0x0000U
 #define PLC_HAL_EEPROM_IMG_ADDR  0x0020U
 #define PLC_HAL_EEPROM_RET_ADDR  0x7020U
+#define PLC_HAL_EEPROM_CFG_ADDR  0x7F80U
 #define PLC_HAL_EEPROM_MAGIC     0x4D464C45U
+#define PLC_HAL_EEPROM_CFG_MAGIC 0x55434647U
+
+// Load persisted unit/network configuration from EEPROM (call before MX_LWIP_Init).
+void PLC_HAL_LoadUnitConfig(void);
+
+// Return pointer to active unit/network configuration.
+const ProtUnitConfig_t *PLC_HAL_GetUnitConfig(void);
 
 // Initialize EEPROM, load any stored MFLW program, and initialize MaraVM + MaraProt.
 bool PLC_HAL_Init(void);

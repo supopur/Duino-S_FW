@@ -22,6 +22,8 @@
 #include "lwip.h"
 #include "lwip/init.h"
 #include "lwip/netif.h"
+#include "lwip/etharp.h"
+#include "lwip/tcpip.h"
 #if (defined ( __CC_ARM ) || defined (__ARMCC_VERSION))  /* MDK ARM Compiler */
 #include "lwip/sio.h"
 #endif /* MDK ARM Compiler */
@@ -31,6 +33,64 @@
 /* USER CODE BEGIN 0 */
 #include "lwip/apps/mdns.h"
 #include "lwip/apps/netbiosns.h"
+#include "plc_hal.h"
+
+static char g_lwip_hostname[16] = "duinos";
+static char g_lwip_netbios[16]  = "DUINOS";
+static uint8_t g_lwip_mdns_inited = 0U;
+
+static void format_hostnames(const char *p_unitName)
+{
+  size_t len = 0U;
+  if (p_unitName != NULL)
+  {
+    for (size_t i = 0U; i < 15U && p_unitName[i] != '\0'; i++)
+    {
+      char c = p_unitName[i];
+      if (c >= 'A' && c <= 'Z')
+      {
+        g_lwip_hostname[len] = (char)(c + ('a' - 'A'));
+        g_lwip_netbios[len]  = c;
+        len++;
+      }
+      else if (c >= 'a' && c <= 'z')
+      {
+        g_lwip_hostname[len] = c;
+        g_lwip_netbios[len]  = (char)(c - ('a' - 'A'));
+        len++;
+      }
+      else if ((c >= '0' && c <= '9') || c == '-')
+      {
+        g_lwip_hostname[len] = c;
+        g_lwip_netbios[len]  = c;
+        len++;
+      }
+      else if (c == ' ' || c == '_')
+      {
+        if (len > 0U && g_lwip_hostname[len - 1U] != '-')
+        {
+          g_lwip_hostname[len] = '-';
+          g_lwip_netbios[len]  = '-';
+          len++;
+        }
+      }
+    }
+  }
+  while (len > 0U && g_lwip_hostname[len - 1U] == '-')
+  {
+    len--;
+  }
+  if (len == 0U)
+  {
+    strcpy(g_lwip_hostname, "duinos");
+    strcpy(g_lwip_netbios, "DUINOS");
+  }
+  else
+  {
+    g_lwip_hostname[len] = '\0';
+    g_lwip_netbios[len]  = '\0';
+  }
+}
 
 static void send_gratuitous_arp_cb(void *arg)
 {
@@ -44,12 +104,66 @@ static void send_gratuitous_arp_cb(void *arg)
 static void init_mdns_netbios_cb(void *arg)
 {
   struct netif *netif = (struct netif *)arg;
-  netif_set_hostname(netif, "duinos");
+  const ProtUnitConfig_t *cfg = PLC_HAL_GetUnitConfig();
+  uint16_t port = (cfg != NULL && cfg->tcpPort != 0U) ? cfg->tcpPort : 5020U;
+  format_hostnames(cfg != NULL ? cfg->unitName : "duinos");
+  netif_set_hostname(netif, g_lwip_hostname);
   netbiosns_init();
-  netbiosns_set_name("DUINOS");
+  netbiosns_set_name(g_lwip_netbios);
   mdns_resp_init();
-  mdns_resp_add_netif(netif, "duinos", 255);
-  mdns_resp_add_service(netif, "duinos", "_maraprot", DNSSD_PROTO_TCP, 5020, 255, NULL, NULL);
+  mdns_resp_add_netif(netif, g_lwip_hostname, 255);
+  mdns_resp_add_service(netif, g_lwip_hostname, "_maraprot", DNSSD_PROTO_TCP, port, 255, NULL, NULL);
+  g_lwip_mdns_inited = 1U;
+}
+
+static void apply_unit_config_cb(void *arg)
+{
+  struct netif *netif = (struct netif *)arg;
+  const ProtUnitConfig_t *cfg = PLC_HAL_GetUnitConfig();
+  if (cfg == NULL || netif == NULL)
+  {
+    return;
+  }
+
+  uint16_t port = (cfg->tcpPort != 0U) ? cfg->tcpPort : 5020U;
+  format_hostnames(cfg->unitName);
+  netif_set_hostname(netif, g_lwip_hostname);
+  netbiosns_set_name(g_lwip_netbios);
+
+#if LWIP_DHCP
+  dhcp_stop(netif);
+#endif
+
+  ip4_addr_t newIp, newMask, newGw;
+  if (cfg->ipMode == 1U)
+  {
+    IP4_ADDR(&newIp,   cfg->staticIp[0],   cfg->staticIp[1],   cfg->staticIp[2],   cfg->staticIp[3]);
+    IP4_ADDR(&newMask, cfg->subnetMask[0], cfg->subnetMask[1], cfg->subnetMask[2], cfg->subnetMask[3]);
+    IP4_ADDR(&newGw,   cfg->gateway[0],    cfg->gateway[1],    cfg->gateway[2],    cfg->gateway[3]);
+    netif_set_addr(netif, &newIp, &newMask, &newGw);
+    if (netif_is_up(netif) && netif_is_link_up(netif) && !ip4_addr_isany_val(newIp))
+    {
+      etharp_gratuitous(netif);
+    }
+  }
+  else
+  {
+    ip4_addr_set_zero(&newIp);
+    ip4_addr_set_zero(&newMask);
+    ip4_addr_set_zero(&newGw);
+    netif_set_addr(netif, &newIp, &newMask, &newGw);
+#if LWIP_DHCP
+    dhcp_start(netif);
+#endif
+  }
+
+  if (g_lwip_mdns_inited)
+  {
+    mdns_resp_remove_netif(netif);
+    mdns_resp_add_netif(netif, g_lwip_hostname, 255);
+    mdns_resp_add_service(netif, g_lwip_hostname, "_maraprot", DNSSD_PROTO_TCP, port, 255, NULL, NULL);
+    mdns_resp_announce(netif);
+  }
 }
 /* USER CODE END 0 */
 /* Private function prototypes -----------------------------------------------*/
@@ -83,10 +197,21 @@ void MX_LWIP_Init(void)
   /* Initialize the LwIP stack with RTOS */
   tcpip_init( NULL, NULL );
 
-  /* IP addresses initialization with DHCP (IPv4) */
-  ipaddr.addr = 0;
-  netmask.addr = 0;
-  gw.addr = 0;
+  const ProtUnitConfig_t *cfg = PLC_HAL_GetUnitConfig();
+  if (cfg != NULL && cfg->ipMode == 1U)
+  {
+    /* Static IPv4 address from persisted unit config */
+    IP4_ADDR(&ipaddr,  cfg->staticIp[0],   cfg->staticIp[1],   cfg->staticIp[2],   cfg->staticIp[3]);
+    IP4_ADDR(&netmask, cfg->subnetMask[0], cfg->subnetMask[1], cfg->subnetMask[2], cfg->subnetMask[3]);
+    IP4_ADDR(&gw,      cfg->gateway[0],    cfg->gateway[1],    cfg->gateway[2],    cfg->gateway[3]);
+  }
+  else
+  {
+    /* IP addresses initialization with DHCP (IPv4) */
+    ipaddr.addr = 0;
+    netmask.addr = 0;
+    gw.addr = 0;
+  }
 
   /* add the network interface (IPv4/IPv6) with RTOS */
   netif_add(&gnetif, &ipaddr, &netmask, &gw, NULL, &ethernetif_init, &tcpip_input);
@@ -109,12 +234,22 @@ void MX_LWIP_Init(void)
   osThreadNew(ethernet_link_thread, &gnetif, &attributes);
 /* USER CODE END H7_OS_THREAD_NEW_CMSIS_RTOS_V2 */
 
-  /* Start DHCP negotiation for a network interface (IPv4) */
-  dhcp_start(&gnetif);
+#if LWIP_DHCP
+  if (cfg == NULL || cfg->ipMode == 0U)
+  {
+    /* Start DHCP negotiation for a network interface (IPv4) */
+    dhcp_start(&gnetif);
+  }
+#endif /* LWIP_DHCP */
 
 /* USER CODE BEGIN 3 */
   tcpip_callback(init_mdns_netbios_cb, &gnetif);
 /* USER CODE END 3 */
+}
+
+void LWIP_ApplyUnitConfig(void)
+{
+  tcpip_callback(apply_unit_config_cb, &gnetif);
 }
 
 #ifdef USE_OBSOLETE_USER_CODE_SECTION_4

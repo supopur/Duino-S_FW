@@ -9,6 +9,7 @@
 #include "hw_tim7.h"
 #include "i2c.h"
 #include "iwdg.h"
+#include "lwip.h"
 #include "lwip/tcp.h"
 #include "lwip/tcpip.h"
 #include "main.h"
@@ -54,6 +55,13 @@ typedef struct {
     uint32_t imageCrc32;
     uint32_t reserved;
 } PlcEepromHeader_t;
+
+typedef struct {
+    uint32_t         magic;
+    uint32_t         crc32;
+    ProtUnitConfig_t config;
+    char             password[PROT_MAX_PASSWORD_BYTES + 1U];
+} PlcEepromUnitConfig_t;
 
 extern volatile uint16_t plc_adc_raw[PLC_ADC_COUNT];
 
@@ -116,6 +124,12 @@ static osSemaphoreId_t   g_plc_hal_tcpTxSem = NULL;
 static uint8_t           g_plc_hal_tcpTxBuf[PROT_MAX_FRAME_BYTES];
 static uint16_t          g_plc_hal_tcpTxLen = 0U;
 static bool              g_plc_hal_tcpTxOk  = false;
+static uint16_t          g_plc_hal_boundTcpPort = 0U;
+static ProtUnitConfig_t  g_plc_hal_unitConfig;
+static char              g_plc_hal_password[PROT_MAX_PASSWORD_BYTES + 1U] = "admin";
+static bool              g_plc_hal_unitConfigLoaded = false;
+static bool              g_plc_hal_netCfgPending = false;
+static uint32_t          g_plc_hal_netCfgApplyTickMs = 0U;
 
 static void ensure_dio_mode(uint16_t dioNum, PlcDioMode_t targetMode)
 {
@@ -356,7 +370,7 @@ static void hal_retentive_write(uint16_t paramId, uint64_t rawBits)
         return;
     }
     uint32_t addr = PLC_HAL_EEPROM_RET_ADDR + ((uint32_t)paramId * sizeof(uint64_t));
-    if ((addr + sizeof(uint64_t)) <= BL24C256A_SIZE_BYTES) {
+    if ((addr + sizeof(uint64_t)) <= PLC_HAL_EEPROM_CFG_ADDR) {
         eeprom_lock();
         BL24C256A_Update(&g_plc_hal_eeprom, (uint16_t)addr, (const uint8_t *)&rawBits, sizeof(rawBits));
         eeprom_unlock();
@@ -370,7 +384,7 @@ static uint64_t hal_retentive_read(uint16_t paramId)
     }
     uint32_t addr = PLC_HAL_EEPROM_RET_ADDR + ((uint32_t)paramId * sizeof(uint64_t));
     uint64_t val  = 0U;
-    if ((addr + sizeof(uint64_t)) <= BL24C256A_SIZE_BYTES) {
+    if ((addr + sizeof(uint64_t)) <= PLC_HAL_EEPROM_CFG_ADDR) {
         eeprom_lock();
         BL24C256A_Read(&g_plc_hal_eeprom, (uint16_t)addr, (uint8_t *)&val, sizeof(val));
         eeprom_unlock();
@@ -427,16 +441,25 @@ static err_t tcp_on_accept(void *arg, struct tcp_pcb *newpcb, err_t err)
 static void tcp_server_init_cb(void *arg)
 {
     (void)arg;
+    uint16_t port = (g_plc_hal_unitConfig.tcpPort != 0U) ? g_plc_hal_unitConfig.tcpPort : PLC_ETH_TCP_PORT;
+    if (g_plc_hal_listenPcb != NULL) {
+        if (g_plc_hal_boundTcpPort == port) {
+            return;
+        }
+        tcp_close(g_plc_hal_listenPcb);
+        g_plc_hal_listenPcb = NULL;
+    }
     struct tcp_pcb *pcb = tcp_new();
     if (pcb == NULL) {
         return;
     }
-    if (tcp_bind(pcb, IP_ADDR_ANY, PLC_ETH_TCP_PORT) != ERR_OK) {
+    if (tcp_bind(pcb, IP_ADDR_ANY, port) != ERR_OK) {
         tcp_close(pcb);
         return;
     }
     g_plc_hal_listenPcb = tcp_listen(pcb);
     if (g_plc_hal_listenPcb != NULL) {
+        g_plc_hal_boundTcpPort = port;
         tcp_accept(g_plc_hal_listenPcb, tcp_on_accept);
     }
 }
@@ -786,11 +809,141 @@ static void load_saved_program_from_eeprom(void)
     }
 }
 
+static void ensure_eeprom_ready(void)
+{
+    if (g_plc_hal_eepromMutex == NULL) {
+        g_plc_hal_eepromMutex = osMutexNew(NULL);
+    }
+    if (g_plc_hal_eepromReady) {
+        return;
+    }
+    g_plc_hal_eepromReady = (BL24C256A_Init(&g_plc_hal_eeprom, &hi2c1, 0U) == BL24C256A_OK);
+    if (!g_plc_hal_eepromReady) {
+        recover_i2c1();
+        for (uint8_t addrPins = 0U; addrPins <= BL24C256A_ADDR_PINS_MAX; addrPins++) {
+            if (BL24C256A_Init(&g_plc_hal_eeprom, &hi2c1, addrPins) == BL24C256A_OK) {
+                g_plc_hal_eepromReady = true;
+                break;
+            }
+        }
+    }
+}
+
+static uint32_t unit_config_crc32(const PlcEepromUnitConfig_t *p_rec)
+{
+    const uint8_t *p_bytes = (const uint8_t *)&p_rec->config;
+    size_t len = sizeof(p_rec->config) + sizeof(p_rec->password);
+    uint32_t crc = 0xFFFFFFFFU;
+    for (size_t i = 0U; i < len; i++) {
+        crc ^= p_bytes[i];
+        for (uint8_t b = 0U; b < 8U; b++) {
+            crc = (crc & 1U) ? ((crc >> 1U) ^ 0xEDB88320U) : (crc >> 1U);
+        }
+    }
+    return ~crc;
+}
+
+static void set_default_unit_config(void)
+{
+    memset(&g_plc_hal_unitConfig, 0, sizeof(g_plc_hal_unitConfig));
+    strncpy(g_plc_hal_unitConfig.unitName, "duinos", sizeof(g_plc_hal_unitConfig.unitName) - 1U);
+    g_plc_hal_unitConfig.stationId         = 1U;
+    g_plc_hal_unitConfig.ipMode            = 1U; /* STATIC by default; configurable from MaraFlow */
+    g_plc_hal_unitConfig.staticIp[0]       = 192U; g_plc_hal_unitConfig.staticIp[1] = 168U;
+    g_plc_hal_unitConfig.staticIp[2]       = 1U;   g_plc_hal_unitConfig.staticIp[3] = 77U;
+    g_plc_hal_unitConfig.subnetMask[0]     = 255U; g_plc_hal_unitConfig.subnetMask[1] = 255U;
+    g_plc_hal_unitConfig.subnetMask[2]     = 255U; g_plc_hal_unitConfig.subnetMask[3] = 0U;
+    g_plc_hal_unitConfig.gateway[0]        = 192U; g_plc_hal_unitConfig.gateway[1] = 168U;
+    g_plc_hal_unitConfig.gateway[2]        = 1U;   g_plc_hal_unitConfig.gateway[3] = 1U;
+    g_plc_hal_unitConfig.tcpPort           = PLC_ETH_TCP_PORT;
+    g_plc_hal_unitConfig.runOutputPin      = 0xFFU;
+    g_plc_hal_unitConfig.faultOutputPin    = 0xFFU;
+    g_plc_hal_unitConfig.estopOutputPin    = 0xFFU;
+    g_plc_hal_unitConfig.bootMode          = 0U;
+    g_plc_hal_unitConfig.safeOutputsOnStop = 1U;
+    g_plc_hal_unitConfig.watchdogEnabled   = 1U;
+    strncpy(g_plc_hal_password, "admin", PROT_MAX_PASSWORD_BYTES);
+    g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
+}
+
+void PLC_HAL_LoadUnitConfig(void)
+{
+    if (g_plc_hal_unitConfigLoaded) {
+        return;
+    }
+    set_default_unit_config();
+    ensure_eeprom_ready();
+    if (g_plc_hal_eepromReady) {
+        PlcEepromUnitConfig_t rec;
+        eeprom_lock();
+        Bl24c256aStatus_t st = BL24C256A_READ_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_CFG_ADDR, &rec);
+        eeprom_unlock();
+        if (st == BL24C256A_OK &&
+            rec.magic == PLC_HAL_EEPROM_CFG_MAGIC &&
+            rec.crc32 == unit_config_crc32(&rec)) {
+            g_plc_hal_unitConfig = rec.config;
+            g_plc_hal_unitConfig.unitName[sizeof(g_plc_hal_unitConfig.unitName) - 1U] = '\0';
+            if (g_plc_hal_unitConfig.tcpPort == 0U) {
+                g_plc_hal_unitConfig.tcpPort = PLC_ETH_TCP_PORT;
+            }
+            memcpy(g_plc_hal_password, rec.password, sizeof(g_plc_hal_password));
+            g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
+        }
+    }
+    g_plc_hal_unitConfigLoaded = true;
+}
+
+const ProtUnitConfig_t *PLC_HAL_GetUnitConfig(void)
+{
+    if (!g_plc_hal_unitConfigLoaded) {
+        set_default_unit_config();
+    }
+    return &g_plc_hal_unitConfig;
+}
+
+static void hal_unit_config_saved(const ProtUnitConfig_t *p_cfg, const char *p_password)
+{
+    if (p_cfg == NULL) {
+        return;
+    }
+    g_plc_hal_unitConfig = *p_cfg;
+    g_plc_hal_unitConfig.unitName[sizeof(g_plc_hal_unitConfig.unitName) - 1U] = '\0';
+    if (g_plc_hal_unitConfig.tcpPort == 0U) {
+        g_plc_hal_unitConfig.tcpPort = PLC_ETH_TCP_PORT;
+    }
+    if (p_password != NULL) {
+        strncpy(g_plc_hal_password, p_password, PROT_MAX_PASSWORD_BYTES);
+        g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
+    }
+
+    if (g_plc_hal_eepromReady) {
+        PlcEepromUnitConfig_t rec;
+        memset(&rec, 0, sizeof(rec));
+        rec.magic  = PLC_HAL_EEPROM_CFG_MAGIC;
+        rec.config = g_plc_hal_unitConfig;
+        memcpy(rec.password, g_plc_hal_password, sizeof(rec.password));
+        rec.crc32  = unit_config_crc32(&rec);
+
+        eeprom_lock();
+        if (BL24C256A_UPDATE_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_CFG_ADDR, &rec) != BL24C256A_OK) {
+            recover_i2c1();
+            BL24C256A_UPDATE_STRUCT(&g_plc_hal_eeprom, PLC_HAL_EEPROM_CFG_ADDR, &rec);
+        }
+        eeprom_unlock();
+    }
+
+    if (PLC_HAL_IsEthMode()) {
+        g_plc_hal_netCfgPending     = true;
+        g_plc_hal_netCfgApplyTickMs = HAL_GetTick() + 150U;
+    }
+}
+
 bool PLC_HAL_Init(void)
 {
     memset(g_plc_hal_dioMode, 0, sizeof(g_plc_hal_dioMode));
     HW_DWT_EnsureInit();
     reset_shield_peripherals();
+    PLC_HAL_LoadUnitConfig();
 
     VmHalVtable_t vtable = {
         .di_read         = hal_di_read,
@@ -810,17 +963,7 @@ bool PLC_HAL_Init(void)
         return false;
     }
 
-    g_plc_hal_eepromMutex = osMutexNew(NULL);
-    g_plc_hal_eepromReady = (BL24C256A_Init(&g_plc_hal_eeprom, &hi2c1, 0U) == BL24C256A_OK);
-    if (!g_plc_hal_eepromReady) {
-        recover_i2c1();
-        for (uint8_t addrPins = 0U; addrPins <= BL24C256A_ADDR_PINS_MAX; addrPins++) {
-            if (BL24C256A_Init(&g_plc_hal_eeprom, &hi2c1, addrPins) == BL24C256A_OK) {
-                g_plc_hal_eepromReady = true;
-                break;
-            }
-        }
-    }
+    ensure_eeprom_ready();
     if (g_plc_hal_eepromReady) {
         load_saved_program_from_eeprom();
     }
@@ -832,22 +975,28 @@ bool PLC_HAL_Init(void)
     }
 
     ProtTransport_t transport = {
-        .kind          = ethMode ? PROT_TRANSPORT_TCP_IP : PROT_TRANSPORT_USB_CDC,
-        .maxMtuBytes   = 512U,
-        .modelId       = PLC_HAL_MODEL_ID,
-        .fwVersion     = PLC_HAL_FW_VERSION,
-        .stationId     = PROT_STATION_P2P,
-        .tx_send       = ethMode ? tcp_tx_send : cdc_tx_send,
-        .get_uptime_ms = HAL_GetTick,
-        .storage_write = eeprom_storage_write,
-        .storage_read  = eeprom_storage_read,
-        .rtc_get       = hal_rtc_unix_sec,
-        .rtc_set       = hal_rtc_set_unix_sec,
-        .onewire_scan  = hal_onewire_scan,
-        .enter_dfu     = enter_rom_dfu
+        .kind              = ethMode ? PROT_TRANSPORT_TCP_IP : PROT_TRANSPORT_USB_CDC,
+        .maxMtuBytes       = 512U,
+        .modelId           = PLC_HAL_MODEL_ID,
+        .fwVersion         = PLC_HAL_FW_VERSION,
+        .stationId         = g_plc_hal_unitConfig.stationId,
+        .tx_send           = ethMode ? tcp_tx_send : cdc_tx_send,
+        .get_uptime_ms     = HAL_GetTick,
+        .storage_write     = eeprom_storage_write,
+        .storage_read      = eeprom_storage_read,
+        .rtc_get           = hal_rtc_unix_sec,
+        .rtc_set           = hal_rtc_set_unix_sec,
+        .onewire_scan      = hal_onewire_scan,
+        .enter_dfu         = enter_rom_dfu,
+        .rng_next          = hal_rng_next,
+        .p_password        = g_plc_hal_password,
+        .unit_config_saved = hal_unit_config_saved
     };
 
     bool ok = PROT_Init(&g_plc_hal_prot, &g_plc_hal_vm, &transport);
+    if (ok) {
+        g_plc_hal_prot.unitConfig = g_plc_hal_unitConfig;
+    }
     g_plc_hal_ready = ok;
     return ok;
 }
@@ -869,6 +1018,12 @@ void PLC_HAL_CdcRxPush(const uint8_t *p_data, uint32_t lenBytes)
 void PLC_HAL_PollProtocol(void)
 {
     poll_comm_mode_switch();
+
+    if (g_plc_hal_netCfgPending && ((int32_t)(HAL_GetTick() - g_plc_hal_netCfgApplyTickMs) >= 0)) {
+        g_plc_hal_netCfgPending = false;
+        LWIP_ApplyUnitConfig();
+        tcpip_callback(tcp_server_init_cb, NULL);
+    }
 
     bool prevUpload = g_plc_hal_prot.uploadActive;
 

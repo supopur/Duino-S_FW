@@ -121,6 +121,9 @@ void MX_FREERTOS_Init(void) {
 /* USER CODE END Header_StartDefaultTask */
 void StartDefaultTask(void *argument)
 {
+  /* Load persisted unit/network config before LwIP initializes */
+  PLC_HAL_LoadUnitConfig();
+
   /* init code for USB_DEVICE or LWIP depending on persisted mode */
   if (PLC_HAL_IsEthMode()) {
     MX_LWIP_Init();
