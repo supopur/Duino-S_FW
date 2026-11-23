@@ -30,7 +30,13 @@ extern "C" {
 #define PROT_AUTH_CHALLENGE_BYTES  16U
 #define PROT_AUTH_KEY_BYTES        32U
 #define PROT_MAX_PASSWORD_BYTES    32U
-#define PROT_UNIT_CONFIG_BYTES     48U
+#define PROT_UNIT_CONFIG_BYTES     50U
+
+typedef enum {
+    PROT_RS485_MODE_MARAPROT      = 0,
+    PROT_RS485_MODE_MODBUS_MASTER = 1,
+    PROT_RS485_MODE_MODBUS_SLAVE  = 2
+} ProtRs485Mode_t;
 
 typedef struct {
     char     unitName[16];
@@ -46,6 +52,8 @@ typedef struct {
     uint8_t  bootMode;
     uint8_t  safeOutputsOnStop;
     uint8_t  watchdogEnabled;
+    uint8_t  rs485Mode;
+    uint8_t  rs485BaudIndex;
 } ProtUnitConfig_t;
 
 typedef enum {

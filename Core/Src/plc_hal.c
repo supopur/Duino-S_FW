@@ -17,6 +17,7 @@
 #include "rtc.h"
 #include "tim.h"
 #include "tmp75.h"
+#include "usart.h"
 #include "usbd_cdc_if.h"
 #include <math.h>
 #include <string.h>
@@ -106,6 +107,7 @@ static const uint8_t kPwmIndexToDio[PLC_PWM_COUNT] = {
 // Place VM workspace and protocol buffers in zero-wait-state 64 KB CCMRAM
 __attribute__((section(".ccmram"))) static VmInstance_t   g_plc_hal_vm;
 __attribute__((section(".ccmram"))) static ProtInstance_t g_plc_hal_prot;
+static ProtInstance_t g_plc_hal_rs485Prot;
 
 static PlcDioMode_t      g_plc_hal_dioMode[PLC_DIO_MAX_INDEX];
 static Bl24c256aDev_t    g_plc_hal_eeprom;
@@ -115,6 +117,12 @@ static volatile bool     g_plc_hal_ready = false;
 static uint8_t           g_plc_hal_cdcRxBuf[PLC_HAL_CDC_RX_BUF_SIZE];
 static volatile uint16_t g_plc_hal_rxHead = 0U;
 static volatile uint16_t g_plc_hal_rxTail = 0U;
+static uint8_t           g_plc_hal_rs485RxBuf[PLC_HAL_RS485_RX_BUF_SIZE];
+static uint16_t          g_plc_hal_rs485RxTail = 0U;
+
+static const uint32_t kRs485BaudRates[8] = {
+    9600U, 19200U, 38400U, 57600U, 115200U, 230400U, 460800U, 921600U
+};
 static uint32_t          g_plc_hal_modeHoldStartMs = 0U;
 static bool              g_plc_hal_modeHolding = false;
 
@@ -574,6 +582,361 @@ static bool cdc_tx_send(const uint8_t *p_data, uint16_t lenBytes)
     return false;
 }
 
+static bool rs485_tx_send(const uint8_t *p_data, uint16_t lenBytes)
+{
+    if (p_data == NULL || lenBytes == 0U || lenBytes > PROT_MAX_FRAME_BYTES) {
+        return false;
+    }
+    return (HAL_UART_Transmit(&huart3, (uint8_t *)(uintptr_t)p_data, lenBytes, 500U) == HAL_OK);
+}
+
+static void start_rs485_rx_dma(void)
+{
+    __HAL_UART_CLEAR_OREFLAG(&huart3);
+    __HAL_UART_CLEAR_NEFLAG(&huart3);
+    __HAL_UART_CLEAR_FEFLAG(&huart3);
+    __HAL_UART_CLEAR_PEFLAG(&huart3);
+    g_plc_hal_rs485RxTail = 0U;
+    HAL_UART_Receive_DMA(&huart3, g_plc_hal_rs485RxBuf, PLC_HAL_RS485_RX_BUF_SIZE);
+}
+
+static void rs485_apply_uart_config(void)
+{
+    uint8_t idx = (g_plc_hal_unitConfig.rs485BaudIndex <= 7U) ? g_plc_hal_unitConfig.rs485BaudIndex : 4U;
+    uint32_t targetBaud = kRs485BaudRates[idx];
+    if (huart3.Init.BaudRate != targetBaud) {
+        HAL_UART_AbortReceive(&huart3);
+        huart3.Init.BaudRate = targetBaud;
+        HAL_UART_Init(&huart3);
+        start_rs485_rx_dma();
+    }
+}
+
+static uint16_t modbus_crc16(const uint8_t *p_data, uint16_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    for (uint16_t i = 0U; i < len; i++) {
+        crc ^= p_data[i];
+        for (uint8_t b = 0U; b < 8U; b++) {
+            if ((crc & 0x0001U) != 0U) {
+                crc = (uint16_t)((crc >> 1U) ^ 0xA001U);
+            } else {
+                crc = (uint16_t)(crc >> 1U);
+            }
+        }
+    }
+    return crc;
+}
+
+static uint16_t rs485_rx_head(void)
+{
+    if (huart3.hdmarx == NULL) {
+        return g_plc_hal_rs485RxTail;
+    }
+    uint16_t dmaRemaining = (uint16_t)__HAL_DMA_GET_COUNTER(huart3.hdmarx);
+    return (uint16_t)((PLC_HAL_RS485_RX_BUF_SIZE - dmaRemaining) % PLC_HAL_RS485_RX_BUF_SIZE);
+}
+
+static int32_t modbus_rtu_master_exec(uint16_t descId, int64_t txVal, int64_t *p_rxVal, int32_t *p_err)
+{
+    if (g_plc_hal_unitConfig.rs485Mode != (uint8_t)PROT_RS485_MODE_MODBUS_MASTER) {
+        if (p_err != NULL) { *p_err = -2; }
+        return -1;
+    }
+    if (huart3.RxState != HAL_UART_STATE_BUSY_RX) {
+        start_rs485_rx_dma();
+    }
+
+    uint8_t  slaveId = (uint8_t)(descId & 0xFFU);
+    uint8_t  regType = (uint8_t)((descId >> 8U) & 0x03U);
+    bool     isWrite = ((descId >> 10U) & 0x01U) != 0U;
+    uint16_t regAddr = (uint16_t)((uint64_t)txVal >> 32U);
+    int32_t  wrVal   = (int32_t)(uint32_t)(uint64_t)txVal;
+
+    uint8_t fc = 0x03U;
+    uint16_t pduVal = 1U;
+    if (isWrite) {
+        if (regType == 0U) {
+            fc = 0x05U;
+            pduVal = (wrVal != 0) ? 0xFF00U : 0x0000U;
+        } else {
+            fc = 0x06U;
+            pduVal = (uint16_t)wrVal;
+        }
+    } else {
+        switch (regType) {
+            case 0U: fc = 0x01U; break;
+            case 1U: fc = 0x02U; break;
+            case 2U: fc = 0x03U; break;
+            default: fc = 0x04U; break;
+        }
+    }
+
+    uint8_t req[8];
+    req[0] = slaveId;
+    req[1] = fc;
+    req[2] = (uint8_t)(regAddr >> 8U);
+    req[3] = (uint8_t)(regAddr & 0xFFU);
+    req[4] = (uint8_t)(pduVal >> 8U);
+    req[5] = (uint8_t)(pduVal & 0xFFU);
+    uint16_t crc = modbus_crc16(req, 6U);
+    req[6] = (uint8_t)(crc & 0xFFU);
+    req[7] = (uint8_t)(crc >> 8U);
+
+    g_plc_hal_rs485RxTail = rs485_rx_head();
+    if (!rs485_tx_send(req, 8U)) {
+        if (p_err != NULL) { *p_err = -1; }
+        return -1;
+    }
+
+    uint16_t expectedLen = isWrite ? 8U : ((fc == 0x01U || fc == 0x02U) ? 6U : 7U);
+    uint8_t  rx[16];
+    uint16_t rxCount = 0U;
+    uint32_t startMs = HAL_GetTick();
+    while ((HAL_GetTick() - startMs) < 120U) {
+        uint16_t head = rs485_rx_head();
+        while (g_plc_hal_rs485RxTail != head && rxCount < sizeof(rx)) {
+            rx[rxCount++] = g_plc_hal_rs485RxBuf[g_plc_hal_rs485RxTail];
+            g_plc_hal_rs485RxTail = (uint16_t)((g_plc_hal_rs485RxTail + 1U) % PLC_HAL_RS485_RX_BUF_SIZE);
+        }
+        if (rxCount >= 5U && rx[0] == slaveId && rx[1] == (uint8_t)(fc | 0x80U)) {
+            uint16_t rxCrc = (uint16_t)(rx[3] | ((uint16_t)rx[4] << 8U));
+            if (modbus_crc16(rx, 3U) == rxCrc) {
+                if (p_err != NULL) { *p_err = (int32_t)rx[2]; }
+                return -1;
+            }
+        }
+        if (rxCount >= expectedLen) {
+            break;
+        }
+        if (osKernelGetState() == osKernelRunning) {
+            osDelay(1);
+        }
+    }
+
+    if (rxCount < expectedLen || rx[0] != slaveId || rx[1] != fc) {
+        if (p_err != NULL) { *p_err = -1; }
+        return -1;
+    }
+    uint16_t rxCrc = (uint16_t)(rx[expectedLen - 2U] | ((uint16_t)rx[expectedLen - 1U] << 8U));
+    if (modbus_crc16(rx, (uint16_t)(expectedLen - 2U)) != rxCrc) {
+        if (p_err != NULL) { *p_err = -3; }
+        return -1;
+    }
+
+    if (!isWrite && p_rxVal != NULL) {
+        if (fc == 0x01U || fc == 0x02U) {
+            *p_rxVal = (int64_t)(rx[3] & 0x01U);
+        } else {
+            int16_t regSigned = (int16_t)(((uint16_t)rx[3] << 8U) | rx[4]);
+            *p_rxVal = (int64_t)regSigned;
+        }
+    }
+    if (p_err != NULL) { *p_err = 0; }
+    return 0;
+}
+
+static uint16_t modbus_read_u16_be(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8U) | p[1]);
+}
+
+static void modbus_send_exception(uint8_t slaveId, uint8_t fc, uint8_t exCode)
+{
+    if (slaveId == 0U) {
+        return;
+    }
+    uint8_t resp[5];
+    resp[0] = slaveId;
+    resp[1] = (uint8_t)(fc | 0x80U);
+    resp[2] = exCode;
+    uint16_t crc = modbus_crc16(resp, 3U);
+    resp[3] = (uint8_t)(crc & 0xFFU);
+    resp[4] = (uint8_t)(crc >> 8U);
+    rs485_tx_send(resp, 5U);
+}
+
+static void poll_modbus_rtu_slave(void)
+{
+    static uint8_t  rxBuf[128];
+    static uint16_t rxLen = 0U;
+    static uint32_t lastRxTick = 0U;
+
+    uint16_t head = rs485_rx_head();
+    while (g_plc_hal_rs485RxTail != head) {
+        uint8_t b = g_plc_hal_rs485RxBuf[g_plc_hal_rs485RxTail];
+        g_plc_hal_rs485RxTail = (uint16_t)((g_plc_hal_rs485RxTail + 1U) % PLC_HAL_RS485_RX_BUF_SIZE);
+        if (rxLen < sizeof(rxBuf)) {
+            rxBuf[rxLen++] = b;
+        }
+        lastRxTick = HAL_GetTick();
+    }
+
+    if (rxLen == 0U || (HAL_GetTick() - lastRxTick) < 4U) {
+        return;
+    }
+
+    uint16_t frameLen = rxLen;
+    rxLen = 0U;
+
+    if (frameLen < 8U) {
+        return;
+    }
+    uint16_t crcRx = (uint16_t)(rxBuf[frameLen - 2U] | ((uint16_t)rxBuf[frameLen - 1U] << 8U));
+    if (modbus_crc16(rxBuf, (uint16_t)(frameLen - 2U)) != crcRx) {
+        return;
+    }
+
+    uint8_t slaveId = rxBuf[0];
+    if (slaveId != g_plc_hal_unitConfig.stationId && slaveId != 0U) {
+        return;
+    }
+
+    uint8_t  fc   = rxBuf[1];
+    uint16_t addr = modbus_read_u16_be(&rxBuf[2]);
+    uint16_t val  = modbus_read_u16_be(&rxBuf[4]);
+    uint8_t  tx[256];
+    uint16_t txLen = 0U;
+
+    switch (fc) {
+        case 0x01U: /* Read Coils (DO0..DO27) */
+        case 0x02U: /* Read Discrete Inputs (DI0..DI27) */ {
+            if (val < 1U || val > 28U || (addr + val) > 28U) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            uint8_t byteCount = (uint8_t)((val + 7U) / 8U);
+            tx[0] = slaveId;
+            tx[1] = fc;
+            tx[2] = byteCount;
+            memset(&tx[3], 0, byteCount);
+            for (uint16_t i = 0U; i < val; i++) {
+                uint16_t ch = (uint16_t)(addr + i);
+                uint8_t bit = (fc == 0x01U)
+                    ? ((ch < PLC_DIO_MAX_INDEX && kDioMap[ch].p_port != NULL &&
+                        HAL_GPIO_ReadPin(kDioMap[ch].p_port, kDioMap[ch].pin) == GPIO_PIN_SET) ? 1U : 0U)
+                    : hal_di_read(ch);
+                if (bit != 0U) {
+                    tx[3U + (i / 8U)] |= (uint8_t)(1U << (i % 8U));
+                }
+            }
+            txLen = (uint16_t)(3U + byteCount);
+            break;
+        }
+        case 0x03U: /* Read Holding Registers (0..1: AO, 100..227: VM intRam) */
+        case 0x04U: /* Read Input Registers (0..3: AI) */ {
+            if (val < 1U || val > 64U) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            uint8_t byteCount = (uint8_t)(val * 2U);
+            tx[0] = slaveId;
+            tx[1] = fc;
+            tx[2] = byteCount;
+            for (uint16_t i = 0U; i < val; i++) {
+                uint16_t rAddr = (uint16_t)(addr + i);
+                int32_t rVal = 0;
+                if (fc == 0x04U) {
+                    if (rAddr >= PLC_ADC_COUNT) {
+                        modbus_send_exception(slaveId, fc, 0x02U);
+                        return;
+                    }
+                    rVal = hal_ai_read(rAddr);
+                } else {
+                    if (rAddr < PLC_DAC_COUNT) {
+                        rVal = (int32_t)HAL_DAC_GetValue(&hdac, (rAddr == 0U) ? DAC_CHANNEL_1 : DAC_CHANNEL_2);
+                    } else if (rAddr >= 100U && (rAddr - 100U) < 128U) {
+                        rVal = g_plc_hal_vm.intRam[rAddr - 100U];
+                    } else {
+                        modbus_send_exception(slaveId, fc, 0x02U);
+                        return;
+                    }
+                }
+                tx[3U + (i * 2U)] = (uint8_t)(((uint16_t)rVal) >> 8U);
+                tx[4U + (i * 2U)] = (uint8_t)(((uint16_t)rVal) & 0xFFU);
+            }
+            txLen = (uint16_t)(3U + byteCount);
+            break;
+        }
+        case 0x05U: /* Write Single Coil (DO0..DO27) */ {
+            if (addr >= PLC_DIO_MAX_INDEX || kDioMap[addr].p_port == NULL) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            hal_do_write(addr, (val == 0xFF00U) ? 1U : 0U);
+            memcpy(tx, rxBuf, 6U);
+            txLen = 6U;
+            break;
+        }
+        case 0x06U: /* Write Single Holding Register */ {
+            int16_t sVal = (int16_t)val;
+            if (addr < PLC_DAC_COUNT) {
+                hal_ao_write(addr, (int32_t)sVal);
+            } else if (addr >= 100U && (addr - 100U) < 128U) {
+                g_plc_hal_vm.intRam[addr - 100U] = (int32_t)sVal;
+            } else {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            memcpy(tx, rxBuf, 6U);
+            txLen = 6U;
+            break;
+        }
+        case 0x0FU: /* Write Multiple Coils */ {
+            if (frameLen < 9U || val < 1U || (addr + val) > PLC_DIO_MAX_INDEX) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            for (uint16_t i = 0U; i < val; i++) {
+                uint8_t bit = (uint8_t)((rxBuf[7U + (i / 8U)] >> (i % 8U)) & 0x01U);
+                hal_do_write((uint16_t)(addr + i), bit);
+            }
+            memcpy(tx, rxBuf, 6U);
+            txLen = 6U;
+            break;
+        }
+        case 0x10U: /* Write Multiple Holding Registers */ {
+            if (frameLen < 9U || val < 1U || val > 64U) {
+                modbus_send_exception(slaveId, fc, 0x02U);
+                return;
+            }
+            for (uint16_t i = 0U; i < val; i++) {
+                uint16_t rAddr = (uint16_t)(addr + i);
+                int16_t sVal = (int16_t)modbus_read_u16_be(&rxBuf[7U + (i * 2U)]);
+                if (rAddr < PLC_DAC_COUNT) {
+                    hal_ao_write(rAddr, (int32_t)sVal);
+                } else if (rAddr >= 100U && (rAddr - 100U) < 128U) {
+                    g_plc_hal_vm.intRam[rAddr - 100U] = (int32_t)sVal;
+                } else {
+                    modbus_send_exception(slaveId, fc, 0x02U);
+                    return;
+                }
+            }
+            memcpy(tx, rxBuf, 6U);
+            txLen = 6U;
+            break;
+        }
+        default:
+            modbus_send_exception(slaveId, fc, 0x01U);
+            return;
+    }
+
+    if (slaveId != 0U && txLen > 0U) {
+        uint16_t crc = modbus_crc16(tx, txLen);
+        tx[txLen++] = (uint8_t)(crc & 0xFFU);
+        tx[txLen++] = (uint8_t)(crc >> 8U);
+        rs485_tx_send(tx, txLen);
+    }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART3) {
+        HAL_UART_AbortReceive(&huart3);
+        start_rs485_rx_dma();
+    }
+}
+
 static bool eeprom_storage_write(uint32_t offset, const uint8_t *p_data, uint16_t lenBytes)
 {
     if (!g_plc_hal_eepromReady) {
@@ -757,6 +1120,10 @@ static int32_t hal_comm_exec(uint8_t busType, uint16_t descId, int64_t txVal, in
         return 0;
     }
 
+    if (busType == VM_COMM_MODBUS_RTU) {
+        return modbus_rtu_master_exec(descId, txVal, p_rxVal, p_err);
+    }
+
     if (p_err != NULL) { *p_err = 1; }
     return -1;
 }
@@ -862,6 +1229,8 @@ static void set_default_unit_config(void)
     g_plc_hal_unitConfig.bootMode          = 0U;
     g_plc_hal_unitConfig.safeOutputsOnStop = 1U;
     g_plc_hal_unitConfig.watchdogEnabled   = 1U;
+    g_plc_hal_unitConfig.rs485Mode         = (uint8_t)PROT_RS485_MODE_MARAPROT;
+    g_plc_hal_unitConfig.rs485BaudIndex    = 4U;
     strncpy(g_plc_hal_password, "admin", PROT_MAX_PASSWORD_BYTES);
     g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
 }
@@ -886,6 +1255,12 @@ void PLC_HAL_LoadUnitConfig(void)
             if (g_plc_hal_unitConfig.tcpPort == 0U) {
                 g_plc_hal_unitConfig.tcpPort = PLC_ETH_TCP_PORT;
             }
+            if (g_plc_hal_unitConfig.rs485Mode > (uint8_t)PROT_RS485_MODE_MODBUS_SLAVE) {
+                g_plc_hal_unitConfig.rs485Mode = (uint8_t)PROT_RS485_MODE_MARAPROT;
+            }
+            if (g_plc_hal_unitConfig.rs485BaudIndex > 7U) {
+                g_plc_hal_unitConfig.rs485BaudIndex = 4U;
+            }
             memcpy(g_plc_hal_password, rec.password, sizeof(g_plc_hal_password));
             g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
         }
@@ -899,6 +1274,15 @@ const ProtUnitConfig_t *PLC_HAL_GetUnitConfig(void)
         set_default_unit_config();
     }
     return &g_plc_hal_unitConfig;
+}
+
+static void sync_prot_unit_config(ProtInstance_t *p_prot)
+{
+    p_prot->unitConfig          = g_plc_hal_unitConfig;
+    p_prot->transport.stationId = g_plc_hal_unitConfig.stationId;
+    strncpy(p_prot->password, g_plc_hal_password, PROT_MAX_PASSWORD_BYTES);
+    p_prot->password[PROT_MAX_PASSWORD_BYTES] = '\0';
+    p_prot->authRequired = (p_prot->password[0] != '\0');
 }
 
 static void hal_unit_config_saved(const ProtUnitConfig_t *p_cfg, const char *p_password)
@@ -915,6 +1299,10 @@ static void hal_unit_config_saved(const ProtUnitConfig_t *p_cfg, const char *p_p
         strncpy(g_plc_hal_password, p_password, PROT_MAX_PASSWORD_BYTES);
         g_plc_hal_password[PROT_MAX_PASSWORD_BYTES] = '\0';
     }
+
+    sync_prot_unit_config(&g_plc_hal_prot);
+    sync_prot_unit_config(&g_plc_hal_rs485Prot);
+    rs485_apply_uart_config();
 
     if (g_plc_hal_eepromReady) {
         PlcEepromUnitConfig_t rec;
@@ -997,8 +1385,19 @@ bool PLC_HAL_Init(void)
     if (ok) {
         g_plc_hal_prot.unitConfig = g_plc_hal_unitConfig;
     }
-    g_plc_hal_ready = ok;
-    return ok;
+
+    ProtTransport_t rs485Transport = transport;
+    rs485Transport.kind            = PROT_TRANSPORT_RS485;
+    rs485Transport.tx_send         = rs485_tx_send;
+    bool rs485Ok = PROT_Init(&g_plc_hal_rs485Prot, &g_plc_hal_vm, &rs485Transport);
+    if (rs485Ok) {
+        g_plc_hal_rs485Prot.unitConfig = g_plc_hal_unitConfig;
+        rs485_apply_uart_config();
+        start_rs485_rx_dma();
+    }
+
+    g_plc_hal_ready = ok && rs485Ok;
+    return g_plc_hal_ready;
 }
 
 void PLC_HAL_CdcRxPush(const uint8_t *p_data, uint32_t lenBytes)
@@ -1025,7 +1424,7 @@ void PLC_HAL_PollProtocol(void)
         tcpip_callback(tcp_server_init_cb, NULL);
     }
 
-    bool prevUpload = g_plc_hal_prot.uploadActive;
+    bool prevUpload = g_plc_hal_prot.uploadActive || g_plc_hal_rs485Prot.uploadActive;
 
     while (g_plc_hal_rxTail != g_plc_hal_rxHead) {
         uint8_t byte = g_plc_hal_cdcRxBuf[g_plc_hal_rxTail];
@@ -1033,8 +1432,25 @@ void PLC_HAL_PollProtocol(void)
         PROT_FeedByte(&g_plc_hal_prot, byte);
     }
 
+    if (huart3.hdmarx != NULL) {
+        if (huart3.RxState != HAL_UART_STATE_BUSY_RX) {
+            start_rs485_rx_dma();
+        } else if (g_plc_hal_unitConfig.rs485Mode == (uint8_t)PROT_RS485_MODE_MARAPROT) {
+            uint16_t rxHead = rs485_rx_head();
+            while (g_plc_hal_rs485RxTail != rxHead) {
+                uint8_t byte = g_plc_hal_rs485RxBuf[g_plc_hal_rs485RxTail];
+                g_plc_hal_rs485RxTail = (uint16_t)((g_plc_hal_rs485RxTail + 1U) % PLC_HAL_RS485_RX_BUF_SIZE);
+                PROT_FeedByte(&g_plc_hal_rs485Prot, byte);
+            }
+        } else if (g_plc_hal_unitConfig.rs485Mode == (uint8_t)PROT_RS485_MODE_MODBUS_SLAVE) {
+            poll_modbus_rtu_slave();
+        }
+    }
+
+    bool currUpload = g_plc_hal_prot.uploadActive || g_plc_hal_rs485Prot.uploadActive;
+
     // If an upload just committed successfully, persist the EEPROM header
-    if (prevUpload && !g_plc_hal_prot.uploadActive && g_plc_hal_vm.hasValidImage && g_plc_hal_eepromReady) {
+    if (prevUpload && !currUpload && g_plc_hal_vm.hasValidImage && g_plc_hal_eepromReady) {
         memset(g_plc_hal_dioMode, 0, sizeof(g_plc_hal_dioMode));
         reset_shield_peripherals();
         PlcEepromHeader_t hdr = {
@@ -1056,7 +1472,8 @@ void PLC_HAL_PollProtocol(void)
 
 void PLC_HAL_StepVmTick(uint32_t tick5msCount)
 {
-    if (!g_plc_hal_ready || g_plc_hal_prot.uploadActive || VM_GetState(&g_plc_hal_vm) != VM_STATE_RUNNING) {
+    bool uploadActive = g_plc_hal_prot.uploadActive || g_plc_hal_rs485Prot.uploadActive;
+    if (!g_plc_hal_ready || uploadActive || VM_GetState(&g_plc_hal_vm) != VM_STATE_RUNNING) {
         return;
     }
 

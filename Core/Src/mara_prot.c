@@ -535,12 +535,14 @@ static void handle_unit_config_get(ProtInstance_t *p_prot, uint16_t seqId)
     p_out[35] = p_prot->unitConfig.bootMode;
     p_out[36] = p_prot->unitConfig.safeOutputsOnStop;
     p_out[37] = p_prot->unitConfig.watchdogEnabled;
+    p_out[48] = p_prot->unitConfig.rs485Mode;
+    p_out[49] = p_prot->unitConfig.rs485BaudIndex;
     send_response(p_prot, seqId, PROT_OP_UNIT_CONFIG_GET, PROT_STATUS_OK, PROT_UNIT_CONFIG_BYTES);
 }
 
 static void handle_unit_config_set(ProtInstance_t *p_prot, uint16_t seqId, const uint8_t *p_req, uint16_t reqLen)
 {
-    if (reqLen < PROT_UNIT_CONFIG_BYTES) {
+    if (reqLen < 48U) {
         send_response(p_prot, seqId, PROT_OP_UNIT_CONFIG_SET, PROT_STATUS_ERR_PARAM, 0U);
         return;
     }
@@ -561,6 +563,10 @@ static void handle_unit_config_set(ProtInstance_t *p_prot, uint16_t seqId, const
     p_prot->unitConfig.bootMode          = p_req[35] ? 1U : 0U;
     p_prot->unitConfig.safeOutputsOnStop = p_req[36] ? 1U : 0U;
     p_prot->unitConfig.watchdogEnabled   = p_req[37] ? 1U : 0U;
+    if (reqLen >= PROT_UNIT_CONFIG_BYTES) {
+        p_prot->unitConfig.rs485Mode      = (p_req[48] <= (uint8_t)PROT_RS485_MODE_MODBUS_SLAVE) ? p_req[48] : (uint8_t)PROT_RS485_MODE_MARAPROT;
+        p_prot->unitConfig.rs485BaudIndex = (p_req[49] <= 7U) ? p_req[49] : 4U;
+    }
     p_prot->transport.stationId          = p_prot->unitConfig.stationId;
 
     if (p_req[38] != '\0') {
@@ -746,6 +752,8 @@ bool PROT_Init(ProtInstance_t *p_prot, VmInstance_t *p_vm, const ProtTransport_t
     p_prot->unitConfig.bootMode          = 0U;
     p_prot->unitConfig.safeOutputsOnStop = 1U;
     p_prot->unitConfig.watchdogEnabled   = 1U;
+    p_prot->unitConfig.rs485Mode         = (uint8_t)PROT_RS485_MODE_MARAPROT;
+    p_prot->unitConfig.rs485BaudIndex    = 4U;
     return true;
 }
 

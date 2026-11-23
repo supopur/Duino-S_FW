@@ -1581,6 +1581,40 @@ VmStatus_t VM_StepThread(VmInstance_t *p_vm, uint8_t threadId, uint32_t dt_us)
                     } else {
                         write_bool(p_vm, dst, 0U);
                     }
+                } else if (flags == VM_COMM_MODBUS_RTU) {
+                    nextPc = pc + 16U;
+                    if (nextPc > p_vm->imageSizeBytes) { break; }
+                    uint16_t regAddr     = read_u16_le(&p_vm->imageBuf[pc + 8U]);
+                    uint16_t valOrOkSlot = read_u16_le(&p_vm->imageBuf[pc + 10U]);
+                    uint16_t errSlot     = read_u16_le(&p_vm->imageBuf[pc + 12U]);
+                    bool     isWrite     = ((srcA >> 10U) & 0x01U) != 0U;
+
+                    if (enabled && p_vm->hal.comm_exec != NULL) {
+                        uint64_t txPacked = ((uint64_t)regAddr << 32U);
+                        if (isWrite) {
+                            txPacked |= (uint64_t)(uint32_t)read_int(p_vm, valOrOkSlot);
+                        }
+                        int64_t rxVal = 0;
+                        int32_t err   = -1;
+                        p_vm->hal.comm_exec(VM_COMM_MODBUS_RTU, srcA, (int64_t)txPacked, &rxVal, &err);
+                        if (!isWrite) {
+                            write_int(p_vm, dst, (int32_t)rxVal);
+                            if (valOrOkSlot != VM_SLOT_ALWAYS_ENABLED) {
+                                write_bool(p_vm, valOrOkSlot, (err == 0) ? 1U : 0U);
+                            }
+                        } else {
+                            write_bool(p_vm, dst, (err == 0) ? 1U : 0U);
+                        }
+                        if (errSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_int(p_vm, errSlot, err);
+                        }
+                    } else {
+                        if (!isWrite && valOrOkSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_bool(p_vm, valOrOkSlot, 0U);
+                        } else if (isWrite) {
+                            write_bool(p_vm, dst, 0U);
+                        }
+                    }
                 }
                 break;
             }

@@ -136,9 +136,10 @@ typedef enum {
 } VmIoKind_t;
 
 typedef enum {
-    VM_COMM_TMP75   = 1,
-    VM_COMM_DS18B20 = 2,
-    VM_COMM_CH455G  = 3
+    VM_COMM_TMP75      = 1,
+    VM_COMM_DS18B20    = 2,
+    VM_COMM_CH455G     = 3,
+    VM_COMM_MODBUS_RTU = 4
 } VmCommBus_t;
 
 typedef struct {
