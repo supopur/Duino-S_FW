@@ -5,13 +5,15 @@
 
 #define TMP75_REG_TEMP         0x00U
 #define TMP75_REG_CONFIG       0x01U
-#define TMP75_CFG_12BIT_CONT   0x60U
+#define TMP75_CFG_12BIT_CONT   0x00U
 
 typedef struct {
+    bool     active;
     bool     initialized;
     bool     ok;
     float    tempC;
     uint32_t lastPollMs;
+    uint32_t lastRetryMs;
     uint8_t  rxBuf[2];
 } Tmp75Slot_t;
 
@@ -77,17 +79,21 @@ bool TMP75_ReadCachedOrStartDma(I2C_HandleTypeDef *p_hi2c, uint8_t addr7Bit, uin
 
     Tmp75Slot_t *p_slot = &g_tmp75_slots[idx];
     if (!p_slot->initialized) {
-        if (HAL_I2C_GetState(p_hi2c) == HAL_I2C_STATE_READY && g_tmp75_activeDmaIdx < 0) {
+        if ((nowMs - p_slot->lastRetryMs) >= 1000U &&
+            HAL_I2C_GetState(p_hi2c) == HAL_I2C_STATE_READY && g_tmp75_activeDmaIdx < 0) {
+            p_slot->lastRetryMs = nowMs;
             TMP75_EnsureInit(p_hi2c, addr7Bit);
         }
     } else if ((nowMs - p_slot->lastPollMs) >= TMP75_POLL_PERIOD_MS) {
         if (g_tmp75_activeDmaIdx < 0 && HAL_I2C_GetState(p_hi2c) == HAL_I2C_STATE_READY) {
             uint16_t addr8Bit = (uint16_t)(addr7Bit << 1U);
             p_slot->lastPollMs = nowMs;
-            g_tmp75_activeDmaIdx = idx;
-            if (HAL_I2C_Mem_Read_DMA(p_hi2c, addr8Bit, TMP75_REG_TEMP, I2C_MEMADD_SIZE_8BIT,
-                                     p_slot->rxBuf, 2U) != HAL_OK) {
-                g_tmp75_activeDmaIdx = -1;
+            if (HAL_I2C_Mem_Read(p_hi2c, addr8Bit, TMP75_REG_TEMP, I2C_MEMADD_SIZE_8BIT,
+                                 p_slot->rxBuf, 2U, 10U) == HAL_OK) {
+                int16_t raw12 = (int16_t)(((uint16_t)p_slot->rxBuf[0] << 8U) | p_slot->rxBuf[1]) >> 4;
+                p_slot->tempC = (float)raw12 * 0.0625f;
+                p_slot->ok = true;
+            } else {
                 p_slot->ok = false;
             }
         }
@@ -96,6 +102,33 @@ bool TMP75_ReadCachedOrStartDma(I2C_HandleTypeDef *p_hi2c, uint8_t addr7Bit, uin
     if (p_tempC != NULL) { *p_tempC = p_slot->tempC; }
     if (p_ok != NULL)    { *p_ok = p_slot->ok; }
     return p_slot->ok;
+}
+
+bool TMP75_GetCached(uint8_t addr7Bit, float *p_tempC, bool *p_ok)
+{
+    int8_t idx = addr_to_idx(addr7Bit);
+    if (idx < 0) {
+        if (p_tempC != NULL) { *p_tempC = 0.0f; }
+        if (p_ok != NULL)    { *p_ok = false; }
+        return false;
+    }
+    Tmp75Slot_t *p_slot = &g_tmp75_slots[idx];
+    p_slot->active = true;
+    if (p_tempC != NULL) { *p_tempC = p_slot->tempC; }
+    if (p_ok != NULL)    { *p_ok = p_slot->ok; }
+    return p_slot->ok;
+}
+
+void TMP75_PollAll(I2C_HandleTypeDef *p_hi2c, uint32_t nowMs)
+{
+    if (p_hi2c == NULL) {
+        return;
+    }
+    for (uint8_t i = 0U; i < TMP75_MAX_SENSORS; i++) {
+        if (g_tmp75_slots[i].active) {
+            TMP75_ReadCachedOrStartDma(p_hi2c, (uint8_t)(TMP75_BASE_ADDR_7BIT + i), nowMs, NULL, NULL);
+        }
+    }
 }
 
 void TMP75_OnI2cRxCplt(I2C_HandleTypeDef *p_hi2c)

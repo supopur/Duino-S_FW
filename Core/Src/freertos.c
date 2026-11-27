@@ -52,6 +52,12 @@ static const osThreadAttr_t kVmTaskAttr = {
   .stack_size = 1024U * 4U,
   .priority   = (osPriority_t) osPriorityAboveNormal,
 };
+static osThreadId_t g_freertos_commIoTaskHandle;
+static const osThreadAttr_t kCommIoTaskAttr = {
+  .name       = "commIoTask",
+  .stack_size = 512U * 4U,
+  .priority   = (osPriority_t) osPriorityBelowNormal,
+};
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -64,6 +70,7 @@ const osThreadAttr_t defaultTask_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 static void vm_scan_task(void *p_argument);
+static void comm_io_task(void *p_argument);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -104,6 +111,7 @@ void MX_FREERTOS_Init(void) {
 
   /* USER CODE BEGIN RTOS_THREADS */
   g_freertos_vmTaskHandle = osThreadNew(vm_scan_task, NULL, &kVmTaskAttr);
+  g_freertos_commIoTaskHandle = osThreadNew(comm_io_task, NULL, &kCommIoTaskAttr);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -154,6 +162,15 @@ static void vm_scan_task(void *p_argument)
     tick5msCount++;
     lastWake_ms += 5U;
     osDelayUntil(lastWake_ms);
+  }
+}
+
+static void comm_io_task(void *p_argument)
+{
+  (void)p_argument;
+  for (;;) {
+    PLC_HAL_StepCommIo();
+    osDelay(1);
   }
 }
 /* USER CODE END Application */

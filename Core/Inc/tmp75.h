@@ -22,6 +22,12 @@ void TMP75_ResetAll(void);
 // Lazily initialize a TMP75 sensor at 7-bit address (0x48..0x4F) in 12-bit mode.
 bool TMP75_EnsureInit(I2C_HandleTypeDef *p_hi2c, uint8_t addr7Bit);
 
+// Return cached temperature (deg C) immediately and register the sensor address for background polling.
+bool TMP75_GetCached(uint8_t addr7Bit, float *p_tempC, bool *p_ok);
+
+// Background I2C1 DMA poller (called from commIoTask).
+void TMP75_PollAll(I2C_HandleTypeDef *p_hi2c, uint32_t nowMs);
+
 // Return cached temperature (deg C) and trigger a background DMA read if due and I2C1 is idle.
 bool TMP75_ReadCachedOrStartDma(I2C_HandleTypeDef *p_hi2c, uint8_t addr7Bit, uint32_t nowMs,
                                 float *p_tempC, bool *p_ok);

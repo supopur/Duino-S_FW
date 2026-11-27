@@ -272,6 +272,7 @@ static void configure_pin_od(GPIO_TypeDef *p_port, uint16_t pin)
     gpio.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     HAL_GPIO_Init(p_port, &gpio);
     ow_release(p_port, pin);
+    HW_DWT_DelayUs(1000U);
 }
 
 void DS18B20_ResetAll(void)
@@ -350,7 +351,7 @@ uint8_t DS18B20_ScanBus(GPIO_TypeDef *p_port, uint16_t pin,
             }
         }
 
-        if (!searchOk || dallas_crc8(rom, 7U) != rom[7]) {
+        if (!searchOk || rom[0] == 0x00U || dallas_crc8(rom, 7U) != rom[7]) {
             break;
         }
 

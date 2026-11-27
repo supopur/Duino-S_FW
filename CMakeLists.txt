@@ -45,6 +45,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/bl24c256a.c
+    Core/Src/bme280.c
     Core/Src/ch455g.c
     Core/Src/ds18b20.c
     Core/Src/hw_tim7.c
@@ -53,6 +54,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/mdns.c
     Core/Src/netbiosns.c
     Core/Src/plc_hal.c
+    Core/Src/rest_client.c
+    Core/Src/sht40.c
     Core/Src/tmp75.c
 )
 

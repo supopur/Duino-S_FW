@@ -51,7 +51,7 @@ void HW_TIM7_EnsureInit(void)
     TIM7->SR   = 0U;
     TIM7->DIER = TIM_DIER_UIE;
 
-    HAL_NVIC_SetPriority(TIM7_IRQn, 6U, 0U);
+    HAL_NVIC_SetPriority(TIM7_IRQn, 1U, 0U);
     HAL_NVIC_EnableIRQ(TIM7_IRQn);
 
     g_tim7_initialized = true;
@@ -76,8 +76,8 @@ void HW_TIM7_ScheduleUs(uint32_t delayUs, HwTim7StepFn_t fn)
     if (!g_tim7_initialized) {
         HW_TIM7_EnsureInit();
     }
-    if (delayUs == 0U) {
-        delayUs = 1U;
+    if (delayUs < 2U) {
+        delayUs = 2U;
     } else if (delayUs > 65535U) {
         delayUs = 65535U;
     }
@@ -116,7 +116,9 @@ void HW_TIM7_OnIrq(void)
     }
     uint32_t nextUs = fn();
     if (nextUs > 0U) {
-        if (nextUs > 65535U) {
+        if (nextUs < 2U) {
+            nextUs = 2U;
+        } else if (nextUs > 65535U) {
             nextUs = 65535U;
         }
         TIM7->CNT  = 0U;

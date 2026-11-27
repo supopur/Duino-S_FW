@@ -536,12 +536,61 @@ uint8_t VM_WriteSlotRaw(VmInstance_t *p_vm, uint16_t slotId, const uint8_t *p_in
     }
 }
 
+void VM_CheckEStop(VmInstance_t *p_vm)
+{
+    if (p_vm == NULL || !p_vm->hasValidImage) {
+        return;
+    }
+    uint32_t cfg = p_vm->header.estopConfig;
+    if ((cfg & 0x01U) == 0U) {
+        return;
+    }
+
+    uint16_t mask = (uint16_t)(p_vm->estopMask & 0x8000U);
+    if (p_vm->hal.di_read != NULL) {
+        for (uint8_t i = 0U; i < 4U; i++) {
+            uint32_t ruleBits = (cfg >> (4U + (i * 7U))) & 0x7FU;
+            if ((ruleBits & 0x01U) == 0U) {
+                continue;
+            }
+            bool     activeLow = ((ruleBits & 0x02U) != 0U);
+            uint16_t ch        = (uint16_t)((ruleBits >> 2U) & 0x1FU);
+            uint8_t  high      = (p_vm->hal.di_read(ch) != 0U) ? 1U : 0U;
+            bool     tripped   = activeLow ? (high == 0U) : (high != 0U);
+            if (tripped) {
+                mask |= (uint16_t)(1U << i);
+            }
+        }
+    }
+
+    if (mask != 0U) {
+        p_vm->estopActive = 1U;
+        p_vm->estopMask   = mask;
+        if (p_vm->runState == VM_STATE_RUNNING) {
+            p_vm->runState = VM_STATE_ESTOP;
+        }
+    } else if ((cfg & 0x04U) == 0U) {
+        p_vm->estopActive = 0U;
+        p_vm->estopMask   = 0U;
+        if (p_vm->runState == VM_STATE_ESTOP) {
+            p_vm->runState = VM_STATE_RUNNING;
+        }
+    }
+}
+
 VmStatus_t VM_StepThread(VmInstance_t *p_vm, uint8_t threadId, uint32_t dt_us)
 {
     if (p_vm == NULL || threadId >= VM_THREAD_COUNT) {
         return VM_ERR_PARAM;
     }
-    if (!p_vm->hasValidImage || p_vm->runState != VM_STATE_RUNNING) {
+    if (!p_vm->hasValidImage) {
+        return VM_OK;
+    }
+    if (threadId == 0U) {
+        if (p_vm->runState != VM_STATE_ESTOP) {
+            return VM_OK;
+        }
+    } else if (p_vm->runState != VM_STATE_RUNNING) {
         return VM_OK;
     }
 
@@ -1614,6 +1663,94 @@ VmStatus_t VM_StepThread(VmInstance_t *p_vm, uint8_t threadId, uint32_t dt_us)
                         } else if (isWrite) {
                             write_bool(p_vm, dst, 0U);
                         }
+                    }
+                } else if (flags == VM_COMM_REST_GET || flags == VM_COMM_REST_POST) {
+                    if ((pc + 16U) > p_vm->imageSizeBytes) { break; }
+                    uint16_t stsOrValSlot  = read_u16_le(&p_vm->imageBuf[pc + 8U]);
+                    uint16_t rdySlot       = read_u16_le(&p_vm->imageBuf[pc + 10U]);
+                    uint8_t  urlLen        = p_vm->imageBuf[pc + 12U];
+                    uint8_t  keyLen        = p_vm->imageBuf[pc + 13U];
+                    uint16_t paddedDataLen = read_u16_le(&p_vm->imageBuf[pc + 14U]);
+                    nextPc = pc + 16U + paddedDataLen;
+                    if (nextPc > p_vm->imageSizeBytes || (uint16_t)(urlLen + keyLen) > paddedDataLen) { break; }
+
+                    bool isPost = (flags == VM_COMM_REST_POST);
+                    if (enabled && p_vm->hal.comm_exec != NULL) {
+                        VmRestReq_t req;
+                        req.p_url      = (const char *)&p_vm->imageBuf[pc + 16U];
+                        req.urlLen     = urlLen;
+                        req.p_jsonKey  = (keyLen > 0U) ? (const char *)&p_vm->imageBuf[pc + 16U + urlLen] : NULL;
+                        req.keyLen     = keyLen;
+                        req.timeoutMs  = srcA;
+                        req.txFloatVal = isPost ? read_float(p_vm, stsOrValSlot) : 0.0f;
+                        int64_t rxVal = 0;
+                        int32_t err   = 0;
+                        p_vm->hal.comm_exec(flags, (uint16_t)pc, (int64_t)(uintptr_t)&req, &rxVal, &err);
+                        uint32_t fBits  = (uint32_t)((uint64_t)rxVal & 0xFFFFFFFFULL);
+                        int16_t  httpSt = (int16_t)(uint16_t)(((uint64_t)rxVal >> 32U) & 0xFFFFU);
+                        uint8_t  rdy    = (uint8_t)(((uint64_t)rxVal >> 48U) & 0x01U);
+                        if (!isPost) {
+                            float outVal = 0.0f;
+                            memcpy(&outVal, &fBits, sizeof(outVal));
+                            write_float(p_vm, dst, outVal);
+                            if (stsOrValSlot != VM_SLOT_ALWAYS_ENABLED) {
+                                write_int(p_vm, stsOrValSlot, (int32_t)httpSt);
+                            }
+                        } else {
+                            write_int(p_vm, dst, (int32_t)httpSt);
+                        }
+                        if (rdySlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_bool(p_vm, rdySlot, rdy);
+                        }
+                    } else if (!enabled && rdySlot != VM_SLOT_ALWAYS_ENABLED) {
+                        write_bool(p_vm, rdySlot, 0U);
+                    }
+                } else if (flags == VM_COMM_BME280) {
+                    nextPc = pc + 16U;
+                    if (nextPc > p_vm->imageSizeBytes) { break; }
+                    uint16_t humSlot = read_u16_le(&p_vm->imageBuf[pc + 8U]);
+                    uint16_t prsSlot = read_u16_le(&p_vm->imageBuf[pc + 10U]);
+                    uint16_t okSlot  = read_u16_le(&p_vm->imageBuf[pc + 12U]);
+                    if (enabled && p_vm->hal.comm_exec != NULL) {
+                        int64_t rxVal = 0;
+                        int32_t err   = 1;
+                        p_vm->hal.comm_exec(VM_COMM_BME280, srcA, 0, &rxVal, &err);
+                        int16_t  t_x100 = (int16_t)(uint16_t)((uint64_t)rxVal & 0xFFFFULL);
+                        uint16_t h_x100 = (uint16_t)(((uint64_t)rxVal >> 16U) & 0xFFFFULL);
+                        uint32_t p_pa   = (uint32_t)(((uint64_t)rxVal >> 32U) & 0xFFFFFFFFULL);
+                        write_float(p_vm, dst, (float)t_x100 / 100.0f);
+                        if (humSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_float(p_vm, humSlot, (float)h_x100 / 100.0f);
+                        }
+                        if (prsSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_float(p_vm, prsSlot, (float)p_pa / 100.0f);
+                        }
+                        if (okSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_bool(p_vm, okSlot, (err == 0) ? 1U : 0U);
+                        }
+                    } else if (!enabled && okSlot != VM_SLOT_ALWAYS_ENABLED) {
+                        write_bool(p_vm, okSlot, 0U);
+                    }
+                } else if (flags == VM_COMM_SHT40) {
+                    nextPc = pc + 12U;
+                    if (nextPc > p_vm->imageSizeBytes) { break; }
+                    uint16_t humSlot = read_u16_le(&p_vm->imageBuf[pc + 8U]);
+                    uint16_t okSlot  = read_u16_le(&p_vm->imageBuf[pc + 10U]);
+                    if (enabled && p_vm->hal.comm_exec != NULL) {
+                        int64_t rxVal = 0;
+                        int32_t err   = 1;
+                        p_vm->hal.comm_exec(VM_COMM_SHT40, srcA, 0, &rxVal, &err);
+                        int16_t  t_x100 = (int16_t)(uint16_t)((uint64_t)rxVal & 0xFFFFULL);
+                        uint16_t h_x100 = (uint16_t)(((uint64_t)rxVal >> 16U) & 0xFFFFULL);
+                        write_float(p_vm, dst, (float)t_x100 / 100.0f);
+                        if (humSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_float(p_vm, humSlot, (float)h_x100 / 100.0f);
+                        }
+                        if (okSlot != VM_SLOT_ALWAYS_ENABLED) {
+                            write_bool(p_vm, okSlot, (err == 0) ? 1U : 0U);
+                        }
+                    } else if (!enabled && okSlot != VM_SLOT_ALWAYS_ENABLED) {
+                        write_bool(p_vm, okSlot, 0U);
                     }
                 }
                 break;

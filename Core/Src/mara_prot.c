@@ -10,6 +10,7 @@
 #define PROT_CTRL_STOP           0U
 #define PROT_CTRL_START          1U
 #define PROT_CTRL_PAUSE          2U
+#define PROT_CTRL_ESTOP_TRIP     4U
 #define PROT_CTRL_ESTOP_RESET    5U
 #define PROT_CTRL_CLEAR_FAULT    6U
 #define PROT_CRYPT_DIR_REQ       0x01U
@@ -228,9 +229,18 @@ static void handle_vm_control(ProtInstance_t *p_prot, uint16_t seqId, const uint
         vmSt = VM_SetState(p_prot->p_vm, VM_STATE_RUNNING);
     } else if (action == PROT_CTRL_PAUSE) {
         vmSt = VM_SetState(p_prot->p_vm, VM_STATE_PAUSED);
+    } else if (action == PROT_CTRL_ESTOP_TRIP) {
+        p_prot->p_vm->estopActive = 1U;
+        p_prot->p_vm->estopMask  |= 0x8000U;
+        if (p_prot->p_vm->runState == VM_STATE_RUNNING) {
+            p_prot->p_vm->runState = VM_STATE_ESTOP;
+        }
     } else if (action == PROT_CTRL_ESTOP_RESET) {
         p_prot->p_vm->estopActive = 0U;
         p_prot->p_vm->estopMask   = 0U;
+        if (p_prot->p_vm->runState == VM_STATE_ESTOP) {
+            p_prot->p_vm->runState = VM_STATE_RUNNING;
+        }
     } else if (action == PROT_CTRL_CLEAR_FAULT) {
         p_prot->p_vm->lastFaultCode = VM_OK;
         p_prot->p_vm->runState      = VM_STATE_STOPPED;

@@ -139,8 +139,21 @@ typedef enum {
     VM_COMM_TMP75      = 1,
     VM_COMM_DS18B20    = 2,
     VM_COMM_CH455G     = 3,
-    VM_COMM_MODBUS_RTU = 4
+    VM_COMM_MODBUS_RTU = 4,
+    VM_COMM_REST_GET   = 5,
+    VM_COMM_REST_POST  = 6,
+    VM_COMM_BME280     = 7,
+    VM_COMM_SHT40      = 8
 } VmCommBus_t;
+
+typedef struct {
+    const char *p_url;
+    uint8_t     urlLen;
+    const char *p_jsonKey;
+    uint8_t     keyLen;
+    uint16_t    timeoutMs;
+    float       txFloatVal;
+} VmRestReq_t;
 
 typedef struct {
     uint8_t  (*di_read)(uint16_t channel);
@@ -226,8 +239,11 @@ VmStatus_t VM_SetState(VmInstance_t *p_vm, VmRunState_t newState);
 // Query current VM run state.
 VmRunState_t VM_GetState(const VmInstance_t *p_vm);
 
-// Execute one scan cycle of threadId (1..5) with elapsed dt_us.
+// Execute one scan cycle of threadId (0=E-Stop, 1..5=normal) with elapsed dt_us.
 VmStatus_t VM_StepThread(VmInstance_t *p_vm, uint8_t threadId, uint32_t dt_us);
+
+// Evaluate hardware E-Stop input rules from header.estopConfig and update VM E-Stop state.
+void VM_CheckEStop(VmInstance_t *p_vm);
 
 // Read raw little-endian bytes for any type-tagged 16-bit SlotID.
 uint8_t VM_ReadSlotRaw(const VmInstance_t *p_vm, uint16_t slotId, uint8_t *p_outBuf);

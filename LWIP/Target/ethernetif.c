@@ -805,10 +805,10 @@ void ethernet_link_thread(void* argument)
 
   struct netif *netif = (struct netif *) argument;
 /* USER CODE BEGIN ETH link init */
-  uint32_t link_up_tick_ms = 0U;
-  uint32_t rx_at_link_up   = 0U;
-  uint8_t  arp_probe_sent  = 0U;
-  uint8_t  was_link_up     = 0U;
+  uint32_t link_up_tick_ms   = 0U;
+  uint32_t rx_at_link_up     = 0U;
+  uint8_t  arp_probe_sent    = 0U;
+  uint8_t  was_link_up       = 0U;
 /* USER CODE END ETH link init */
 
   for(;;)
@@ -876,7 +876,6 @@ void ethernet_link_thread(void* argument)
     else if (g_eth_rx_frames == rx_at_link_up)
     {
       uint32_t elapsed = HAL_GetTick() - link_up_tick_ms;
-      uint32_t retry_ms = ip4_addr_isany_val(*netif_ip4_addr(netif)) ? 2000U : 1000U;
       if (arp_probe_sent == 0U && elapsed >= 150U)
       {
         arp_probe_sent = 1U;
@@ -887,20 +886,10 @@ void ethernet_link_thread(void* argument)
         arp_probe_sent = 2U;
         tcpip_callback(eth_send_gw_arp_cb, netif);
       }
-      else if (elapsed >= retry_ms)
+      else if (arp_probe_sent == 2U && elapsed >= 1500U)
       {
-        HAL_ETH_Stop_IT(&heth);
-        netif_set_down(netif);
-        netif_set_link_down(netif);
-        was_link_up = 0U;
-
-        HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_RESET);
-        osDelay(25);
-        HAL_GPIO_WritePin(ETH_RST_N_GPIO_Port, ETH_RST_N_Pin, GPIO_PIN_SET);
-        osDelay(200);
-
-        ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x04U, 0x0061U);
-        ETH_PHY_IO_WriteReg(DP83848.DevAddr, 0x00U, 0x1200U);
+        arp_probe_sent = 3U;
+        tcpip_callback(eth_send_gw_arp_cb, netif);
       }
     }
   }

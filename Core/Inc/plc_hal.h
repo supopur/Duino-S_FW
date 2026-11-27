@@ -43,6 +43,9 @@ void PLC_HAL_PollProtocol(void);
 // Step all active MaraVM threads according to a 5 ms base tick.
 void PLC_HAL_StepVmTick(uint32_t tick5msCount);
 
+// Step non-blocking background I/O (Modbus RTU Master DMA, I2C1 sensors, retentive EEPROM).
+void PLC_HAL_StepCommIo(void);
+
 // Return true if Duino - S is booted in Ethernet (LwIP TCP) mode, false for USB CDC mode.
 bool PLC_HAL_IsEthMode(void);
 
